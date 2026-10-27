@@ -1,0 +1,18 @@
+// Azure Local VMs (Microsoft.AzureStackHCI/virtualMachineInstances) in an unexpected state.
+// Runs against Azure Resource Graph through arg(""). Placeholders are filled in at deployment time.
+// Test it first in Resource Graph Explorer (without the arg(""). prefix).
+arg("").Resources
+| where type =~ 'microsoft.azurestackhci/virtualmachineinstances'
+| where resourceGroup in~ (dynamic([{{RESOURCE_GROUPS}}]))
+| extend vmName = tolower(tostring(split(id, '/')[8]))
+| where vmName !in~ (dynamic([{{EXCLUDED_VMS}}]))
+| extend powerState = tostring(properties.status.powerState),
+         provisioningState = tostring(properties.provisioningState),
+         guestAgent = tostring(properties.instanceView.vmAgent.statuses[0].displayStatus)
+| extend problem = case(
+    provisioningState =~ 'Failed', 'ProvisioningFailed',
+    powerState in~ (dynamic([{{POWER_STATES}}])), strcat('PowerState-', powerState),
+    {{CHECK_GUEST_AGENT}} and guestAgent !~ 'Connected', strcat('GuestAgent-', iff(isempty(guestAgent), 'None', guestAgent)),
+    '')
+| where isnotempty(problem)
+| project vmName, problem, resourceGroup, powerState, provisioningState, guestAgent

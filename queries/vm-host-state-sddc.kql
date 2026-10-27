@@ -1,0 +1,19 @@
+// VM state counts per node from SDDC Management event 3000 (collected by the Insights DCR).
+// RenderedDescription is JSON with m_servers[].m_vm.m_totalVms<State>.
+// Only the latest snapshot per node is evaluated.
+let includeTransitional = {{INCLUDE_TRANSITIONAL}};
+Event
+| where EventLog == "Microsoft-Windows-SDDC-Management/Operational" and EventID == 3000
+| extend payload = parse_json(RenderedDescription)
+| mv-expand server = payload.m_servers
+| extend NodeName = tolower(tostring(split(tostring(server.m_name), ".")[0])), vm = server.m_vm
+| summarize arg_max(TimeGenerated, vm) by NodeName
+| extend Failed = coalesce(toint(vm.m_totalVmsFailed), 0),
+         Paused = coalesce(toint(vm.m_totalVmsPaused), 0),
+         Suspended = coalesce(toint(vm.m_totalVmsSuspended), 0),
+         Unknown = coalesce(toint(vm.m_totalVmsUnknown), 0),
+         Transitional = coalesce(toint(vm.m_totalVmsStarting), 0) + coalesce(toint(vm.m_totalVmsStopping), 0)
+                      + coalesce(toint(vm.m_totalVmsSaving), 0) + coalesce(toint(vm.m_totalVmsPausing), 0)
+                      + coalesce(toint(vm.m_totalVmsResuming), 0) + coalesce(toint(vm.m_totalVmsSnapshotting), 0)
+| extend ProblemVmCount = Failed + Paused + Suspended + Unknown + iff(includeTransitional, Transitional, 0)
+| project NodeName, ProblemVmCount, Failed, Paused, Suspended, Unknown, Transitional, SnapshotTime = TimeGenerated

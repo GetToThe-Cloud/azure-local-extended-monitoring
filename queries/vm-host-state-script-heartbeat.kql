@@ -1,0 +1,13 @@
+// Minutes since Watch-AzLocalVmState.ps1 last reported (event 4100) per node.
+// Nodes that never reported get 9999, so a missing task is detected too.
+let expectedNodes = dynamic([{{NODE_NAMES}}]);
+let lastRun = Event
+    | where EventLog == "Application" and Source == "{{EVENT_SOURCE}}" and EventID == 4100
+    | extend NodeName = tolower(tostring(split(Computer, ".")[0]))
+    | where NodeName in (expectedNodes)
+    | summarize LastRun = max(TimeGenerated) by NodeName;
+print NodeName = expectedNodes
+| mv-expand NodeName to typeof(string)
+| join kind=leftouter lastRun on NodeName
+| extend MinutesSinceLastRun = iff(isnull(LastRun), long(9999), datetime_diff('minute', now(), LastRun))
+| project NodeName, MinutesSinceLastRun

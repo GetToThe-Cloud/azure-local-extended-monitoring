@@ -1,0 +1,8 @@
+// Failover clustering (System log) and Hyper-V worker events from Azure Local nodes,
+// collected by the supplemental DCR. The event ID list is filled in at deployment time.
+Event
+| where (EventLog == "System" and Source == "Microsoft-Windows-FailoverClustering")
+    or EventLog == "Microsoft-Windows-Hyper-V-Worker-Admin"
+| where EventID in ({{EVENT_IDS}})
+| extend NodeName = tolower(tostring(split(Computer, ".")[0])), EventIdText = tostring(EventID)
+| summarize EventCount = count() by NodeName, EventIdText

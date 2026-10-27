@@ -1,0 +1,12 @@
+// Per-VM problems reported by Watch-AzLocalVmState.ps1 (event 4101, JSON message).
+// Latest report per VM; a VM that recovers stops being reported and the alert resolves.
+Event
+| where EventLog == "Application" and Source == "{{EVENT_SOURCE}}" and EventID == 4101
+| extend payload = parse_json(RenderedDescription)
+| extend VmName = tostring(payload.vmName),
+         VmState = tostring(payload.state),
+         ClusterState = tostring(payload.clusterState),
+         NodeName = tolower(tostring(split(Computer, ".")[0]))
+| summarize arg_max(TimeGenerated, VmState, ClusterState, NodeName) by VmName
+| extend Problem = iff(isempty(ClusterState), VmState, strcat(VmState, "-Cluster", ClusterState))
+| project VmName, Problem, NodeName

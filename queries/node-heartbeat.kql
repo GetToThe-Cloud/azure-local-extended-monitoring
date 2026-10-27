@@ -1,0 +1,13 @@
+// Minutes since the last Azure Monitor Agent heartbeat per Azure Local node.
+// Nodes without any heartbeat in the query window get 9999, so a node that is
+// completely gone is still reported. The node list is filled in at deployment time.
+let expectedNodes = dynamic([{{NODE_NAMES}}]);
+let lastSeen = Heartbeat
+    | extend NodeName = tolower(tostring(split(Computer, ".")[0]))
+    | where NodeName in (expectedNodes)
+    | summarize LastHeartbeat = max(TimeGenerated) by NodeName;
+print NodeName = expectedNodes
+| mv-expand NodeName to typeof(string)
+| join kind=leftouter lastSeen on NodeName
+| extend MinutesSinceLastHeartbeat = iff(isnull(LastHeartbeat), long(9999), datetime_diff('minute', now(), LastHeartbeat))
+| project NodeName, MinutesSinceLastHeartbeat
