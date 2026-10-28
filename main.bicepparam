@@ -7,16 +7,17 @@ using './main.bicep'
 param namePrefix = 'azl'
 
 // Workspace that Insights for Azure Local uses (DCR name starts with AzureStackHCI-)
-param workspaceResourceId = '/subscriptions/0c099ebb-b857-4ac4-98b6-b753e9dc4850/resourcegroups/rsg-lz-monitoring-01/providers/microsoft.operationalinsights/workspaces/law-lz-01'
+param workspaceResourceId = '/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-monitoring/providers/Microsoft.OperationalInsights/workspaces/law-azurelocal'
 
 // Resource group with the cluster, the node Arc machines, the Azure Local VMs and the Arc resource bridge
-param clusterResourceGroupName = 'rsg-lz-azlocal-01'
+param clusterResourceGroupName = 'rg-azurelocal-prod'
 
 param clusters = [
   {
-    name: 'cluster'
+    name: 'azl-clus01'
     nodeNames: [
-      'node01'
+      'azl-node01'
+      'azl-node02'
     ]
   }
 ]
@@ -24,7 +25,7 @@ param clusters = [
 param emailReceivers = [
   {
     name: 'Operations'
-    emailAddress: 'demo@gettothe.cloud'
+    emailAddress: 'ops@contoso.com'
   }
 ]
 

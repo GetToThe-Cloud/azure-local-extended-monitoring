@@ -69,8 +69,9 @@ resource sddcAlert 'Microsoft.Insights/scheduledQueryRules@2023-12-01' = if (dep
     // Wide window so the latest snapshot is always included, also with the default 60 minute interval.
     windowSize: 'PT2H'
     autoMitigate: true
-    // Validation at creation would run as the alert identity, whose role assignment can take a few
-    // minutes to propagate. The queries are covered by the test procedure in the README instead.
+    // Skips only the query syntax check. The service still checks the identity's access to the
+    // workspace when the rule is saved, which is why Deploy-AzLocalMonitoring.ps1 creates the
+    // identity and its roles first and deploys the rules after the roles have propagated.
     skipQueryValidation: true
     criteria: {
       allOf: [
@@ -127,8 +128,9 @@ resource scriptVmAlert 'Microsoft.Insights/scheduledQueryRules@2023-12-01' = if 
     evaluationFrequency: 'PT5M'
     windowSize: 'PT15M'
     autoMitigate: true
-    // Validation at creation would run as the alert identity, whose role assignment can take a few
-    // minutes to propagate. The queries are covered by the test procedure in the README instead.
+    // Skips only the query syntax check. The service still checks the identity's access to the
+    // workspace when the rule is saved, which is why Deploy-AzLocalMonitoring.ps1 creates the
+    // identity and its roles first and deploys the rules after the roles have propagated.
     skipQueryValidation: true
     criteria: {
       allOf: [
@@ -191,8 +193,9 @@ resource scriptRunAlert 'Microsoft.Insights/scheduledQueryRules@2023-12-01' = if
     evaluationFrequency: 'PT15M'
     windowSize: 'PT1H'
     autoMitigate: true
-    // Validation at creation would run as the alert identity, whose role assignment can take a few
-    // minutes to propagate. The queries are covered by the test procedure in the README instead.
+    // Skips only the query syntax check. The service still checks the identity's access to the
+    // workspace when the rule is saved, which is why Deploy-AzLocalMonitoring.ps1 creates the
+    // identity and its roles first and deploys the rules after the roles have propagated.
     skipQueryValidation: true
     criteria: {
       allOf: [

@@ -62,8 +62,9 @@ resource vmStateAlert 'Microsoft.Insights/scheduledQueryRules@2023-12-01' = {
     evaluationFrequency: 'PT15M'
     windowSize: 'PT15M'
     autoMitigate: true
-    // The alert identity may still be waiting for its role assignments, and the deploying user may
-    // not see the VMs through Resource Graph, so skip validation at deployment time.
+    // Skips only the query syntax check. The service still checks the identity's access when the
+    // rule is saved, which is why Deploy-AzLocalMonitoring.ps1 creates the identity and its roles
+    // first and deploys the rules after the roles have propagated.
     skipQueryValidation: true
     criteria: {
       allOf: [

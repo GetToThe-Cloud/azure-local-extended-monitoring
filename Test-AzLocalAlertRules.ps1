@@ -449,6 +449,7 @@ foreach ($rule in $rules) {
     }
 
     # Resource health
+    $healthUnknown = $false
     try {
         $health = Invoke-Arm -Path "$($rule.id)/providers/Microsoft.ResourceHealth/availabilityStatuses/current?api-version=$($ApiVersions.Health)"
         if ($health) {
@@ -457,11 +458,10 @@ foreach ($rule in $rules) {
             if (-not $since) { $since = $health.properties.occurredTime }
             $text = "Resource health: $state. $($health.properties.summary) $($health.properties.reasonType)".Trim()
             if ($since) { $text += " (since $(Format-Utc $since))" }
-            $status = switch ($state) { 'Available' { 'OK' } 'Unknown' { 'WARN' } default { 'FAIL' } }
+            # Unknown is judged after the fired alerts are known: it lags behind and also shows on rules that fire
+            $status = switch ($state) { 'Available' { 'OK' } 'Unknown' { 'INFO' } default { 'FAIL' } }
             Write-Check $status $text $subject
-            if ($state -eq 'Unknown' -and [System.Xml.XmlConvert]::ToTimeSpan("$($p.evaluationFrequency)").TotalMinutes -le 15) {
-                Write-Check 'INFO' 'Unknown on a rule that runs every 15 minutes or more often: the alert service has not reported a completed evaluation'
-            }
+            $healthUnknown = ($state -eq 'Unknown')
         }
         else {
             Write-Check 'INFO' 'Resource health: no status'
@@ -493,6 +493,15 @@ foreach ($rule in $rules) {
     }
     catch {
         Write-Check 'INFO' "Cannot list fired alerts: $($_.Exception.Message)"
+    }
+
+    if ($healthUnknown -and $alertsKnown) {
+        if ($alerts.Count -gt 0) {
+            Write-Check 'INFO' 'Resource health Unknown, but the rule fired: Resource health lags behind and can be ignored here'
+        }
+        elseif ([System.Xml.XmlConvert]::ToTimeSpan("$($p.evaluationFrequency)").TotalMinutes -le 15) {
+            Write-Check 'WARN' 'Resource health Unknown and no alerts in 24 hours: the alert service may not complete its evaluations of this rule' $subject
+        }
     }
 
     # The rule's own query
