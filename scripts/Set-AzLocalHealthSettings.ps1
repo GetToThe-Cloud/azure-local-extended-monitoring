@@ -14,7 +14,7 @@
       log alerts get fresher data (default 3600 seconds, minimum 900 seconds).
 
     Shows current and new values. Use -DryRun to only show what would change.
-    Written to run in Constrained Language Mode (Application Control/WDAC enforced on Azure Local).
+    Written to also run in Constrained Language Mode (for example under a strict App Control policy).
 
 .PARAMETER VolumeCapacityWarningPercent
     Health Service warning threshold for volume capacity. Microsoft default: 80.

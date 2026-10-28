@@ -12,6 +12,9 @@ param workspaceId string
 @description('Resource ID of the action group.')
 param actionGroupId string
 
+@description('Resource ID of the user-assigned managed identity the rule runs its query with.')
+param identityId string
+
 @description('Event IDs that raise a Sev1 alert.')
 param criticalEventIds int[]
 
@@ -50,6 +53,12 @@ resource eventAlerts 'Microsoft.Insights/scheduledQueryRules@2023-12-01' = [
     location: location
     tags: tags
     kind: 'LogAlert'
+    identity: {
+      type: 'UserAssigned'
+      userAssignedIdentities: {
+        '${identityId}': {}
+      }
+    }
     properties: {
       displayName: rule.displayName
       description: rule.description
@@ -63,6 +72,9 @@ resource eventAlerts 'Microsoft.Insights/scheduledQueryRules@2023-12-01' = [
       evaluationFrequency: 'PT5M'
       windowSize: 'PT15M'
       autoMitigate: true
+      // Validation at creation would run as the alert identity, whose role assignment can take a few
+      // minutes to propagate. The queries are covered by the test procedure in the README instead.
+      skipQueryValidation: true
       criteria: {
         allOf: [
           {

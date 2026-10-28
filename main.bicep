@@ -199,7 +199,13 @@ param resourceHealthResourceTypes string[] = [
 @description('Deploy the VM state alert (Azure Resource Graph query via log search alert with managed identity).')
 param deployVmStateAlert bool = true
 
-@description('Create the role assignments (Reader on the cluster resource group, Log Analytics Reader on the workspace) for the VM state alert identity. Requires Owner or User Access Administrator.')
+@description('Create the role assignments for the alert identity that every log search alert runs as: Log Analytics Reader on the workspace and, for the Azure Local VM state alert, Reader on the cluster resource group. Requires Owner, User Access Administrator or Role Based Access Control Administrator on those scopes.')
+param deployAlertRoleAssignments bool = true
+
+@description('Deploy the log search alert rules. False deploys everything else, including the alert identity and its role assignments. The deploy script uses false for its first phase, so the role assignments have time to propagate before the rules are created: the Log Search Alerts service checks the identity\'s access when a rule is saved.')
+param deployLogAlertRules bool = true
+
+@description('Deprecated, use deployAlertRoleAssignments. Kept so existing parameter files keep working; false also disables the role assignments.')
 param deployVmStateRoleAssignments bool = true
 
 @description('Install the Azure Monitor Agent extension on the clusters. Not needed when Insights is already enabled.')
@@ -252,6 +258,14 @@ var eventXPathQueries = concat(clusterXPathList, hyperVXPathList, vmStateScriptX
 
 var deployClusterExtensions = deployAmaExtension || deployHealthAlertsExtension
 
+// Log search alerts run their query as one shared user-assigned identity. Without an identity a
+// rule uses the permissions of whoever last saved it, which breaks silently when that account
+// loses access (an expired PIM activation, a colleague who leaves, a pipeline principal).
+var deployAnyLogAlert = deployEventAlerts || deployHeartbeatAlert || deployVmStateAlert || deployVmHostStateSddcAlert || deployVmHostStateScript
+var createAlertRoleAssignments = deployAlertRoleAssignments && deployVmStateRoleAssignments
+var readerRoleId = 'acdd72a7-3385-48ef-bd42-f606fba81ae7'
+var logAnalyticsReaderRoleId = '73c42c96-874c-492b-b04d-ab87d138a893'
+
 // ============================================================================
 // Existing resources
 // ============================================================================
@@ -272,6 +286,38 @@ module actionGroup 'modules/action-group.bicep' = {
     shortName: actionGroupShortName
     emailReceivers: emailReceivers
     tags: tags
+  }
+}
+
+module alertIdentity 'modules/alert-identity.bicep' = {
+  name: take('${namePrefix}-alert-identity-${uniqueString(deployment().name)}', 64)
+  params: {
+    name: '${namePrefix}-id-alert-rules'
+    location: workspace.location
+    tags: tags
+  }
+}
+
+// Log Analytics Reader on the workspace: every log search alert runs its query there.
+module alertIdentityWorkspaceReader 'modules/role-assignment-workspace.bicep' = if (deployAnyLogAlert && createAlertRoleAssignments) {
+  name: take('${namePrefix}-ra-alert-law-${uniqueString(deployment().name)}', 64)
+  scope: resourceGroup(workspaceSubscriptionId, workspaceResourceGroupName)
+  params: {
+    workspaceName: workspaceName
+    principalId: alertIdentity.outputs.principalId
+    roleDefinitionId: logAnalyticsReaderRoleId
+    assignmentDescription: 'Azure Local monitoring: log search alert rules query this workspace.'
+  }
+}
+
+// Reader on the cluster resource group: the Azure Local VM state alert reads the VMs through Resource Graph.
+module alertIdentityClusterReader 'modules/role-assignment-rg.bicep' = if (deployVmStateAlert && createAlertRoleAssignments) {
+  name: take('${namePrefix}-ra-alert-rg-${uniqueString(deployment().name)}', 64)
+  scope: resourceGroup(clusterSubscriptionId, clusterResourceGroupName)
+  params: {
+    principalId: alertIdentity.outputs.principalId
+    roleDefinitionId: readerRoleId
+    assignmentDescription: 'Azure Local monitoring: VM state alert reads Azure Local VMs through Resource Graph.'
   }
 }
 
@@ -317,30 +363,38 @@ module eventCollection 'modules/event-collection.bicep' = if (deployEventCollect
   }
 }
 
-module eventLogAlerts 'modules/event-log-alerts.bicep' = if (deployEventAlerts) {
+module eventLogAlerts 'modules/event-log-alerts.bicep' = if (deployLogAlertRules && deployEventAlerts) {
   name: take('${namePrefix}-event-alerts-${uniqueString(deployment().name)}', 64)
   params: {
     namePrefix: namePrefix
     location: workspace.location
     workspaceId: workspaceResourceId
     actionGroupId: actionGroup.outputs.id
+    identityId: alertIdentity.outputs.id
     criticalEventIds: criticalClusterEventIds
     warningEventIds: concat(warningClusterEventIds, hyperVWorkerEventIds)
     tags: tags
   }
+  dependsOn: [
+    alertIdentityWorkspaceReader
+  ]
 }
 
-module heartbeatAlert 'modules/heartbeat-alert.bicep' = if (deployHeartbeatAlert) {
+module heartbeatAlert 'modules/heartbeat-alert.bicep' = if (deployLogAlertRules && deployHeartbeatAlert) {
   name: take('${namePrefix}-heartbeat-${uniqueString(deployment().name)}', 64)
   params: {
     name: '${namePrefix}-node-heartbeat-missing'
     location: workspace.location
     workspaceId: workspaceResourceId
     actionGroupId: actionGroup.outputs.id
+    identityId: alertIdentity.outputs.id
     nodeNames: allNodeNames
     thresholdMinutes: thresholds.heartbeatMinutes
     tags: tags
   }
+  dependsOn: [
+    alertIdentityWorkspaceReader
+  ]
 }
 
 module resourceHealthAlert 'modules/resource-health-alert.bicep' = if (deployResourceHealthAlert) {
@@ -356,7 +410,7 @@ module resourceHealthAlert 'modules/resource-health-alert.bicep' = if (deployRes
   }
 }
 
-module vmStateAlert 'modules/vm-state-alert.bicep' = if (deployVmStateAlert) {
+module vmStateAlert 'modules/vm-state-alert.bicep' = if (deployLogAlertRules && deployVmStateAlert) {
   name: take('${namePrefix}-vmstate-${uniqueString(deployment().name)}', 64)
   params: {
     name: '${namePrefix}-vm-state'
@@ -366,26 +420,26 @@ module vmStateAlert 'modules/vm-state-alert.bicep' = if (deployVmStateAlert) {
     resourceGroupNames: [
       clusterResourceGroupName
     ]
+    identityId: alertIdentity.outputs.id
     alertPowerStates: vmAlertPowerStates
     checkGuestAgent: vmAlertOnGuestAgent
     excludedVmNames: vmExcludedNames
-    deployRoleAssignments: deployVmStateRoleAssignments
-    clusterSubscriptionId: clusterSubscriptionId
-    clusterResourceGroupName: clusterResourceGroupName
-    workspaceSubscriptionId: workspaceSubscriptionId
-    workspaceResourceGroupName: workspaceResourceGroupName
-    workspaceName: workspaceName
     tags: tags
   }
+  dependsOn: [
+    alertIdentityWorkspaceReader
+    alertIdentityClusterReader
+  ]
 }
 
-module vmHostStateAlerts 'modules/vm-host-state-alerts.bicep' = if (deployVmHostStateSddcAlert || deployVmHostStateScript) {
+module vmHostStateAlerts 'modules/vm-host-state-alerts.bicep' = if (deployLogAlertRules && (deployVmHostStateSddcAlert || deployVmHostStateScript)) {
   name: take('${namePrefix}-vmhoststate-${uniqueString(deployment().name)}', 64)
   params: {
     namePrefix: namePrefix
     location: workspace.location
     workspaceId: workspaceResourceId
     actionGroupId: actionGroup.outputs.id
+    identityId: alertIdentity.outputs.id
     nodeNames: allNodeNames
     deploySddcAlert: deployVmHostStateSddcAlert
     includeTransitional: vmHostStateIncludeTransitional
@@ -394,6 +448,9 @@ module vmHostStateAlerts 'modules/vm-host-state-alerts.bicep' = if (deployVmHost
     scriptMaxSilenceMinutes: vmHostStateScriptMaxSilenceMinutes
     tags: tags
   }
+  dependsOn: [
+    alertIdentityWorkspaceReader
+  ]
 }
 
 module clusterExtensions 'modules/cluster-extensions.bicep' = [
@@ -419,3 +476,9 @@ output actionGroupId string = actionGroup.outputs.id
 
 @description('XPath queries used by the supplemental DCR.')
 output eventXPathQueries string[] = eventXPathQueries
+
+@description('Resource ID of the managed identity the log search alert rules run as.')
+output alertIdentityId string = alertIdentity.outputs.id
+
+@description('Principal (object) ID of the managed identity the log search alert rules run as.')
+output alertIdentityPrincipalId string = alertIdentity.outputs.principalId

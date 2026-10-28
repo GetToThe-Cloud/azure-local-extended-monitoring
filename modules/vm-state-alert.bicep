@@ -1,4 +1,4 @@
-metadata description = 'Alerts on Azure Local VM state (power state, provisioning state, guest agent) via an Azure Resource Graph query in a log search alert with a system-assigned managed identity.'
+metadata description = 'Alerts on Azure Local VM state (power state, provisioning state, guest agent) via an Azure Resource Graph query in a log search alert that runs as the shared alert identity (Reader on the cluster resource group, see main.bicep).'
 
 @description('Name of the alert rule.')
 param name string
@@ -12,6 +12,9 @@ param workspaceId string
 @description('Resource ID of the action group.')
 param actionGroupId string
 
+@description('Resource ID of the user-assigned managed identity the rule runs its query with.')
+param identityId string
+
 @description('Resource groups that contain the Azure Local VMs.')
 param resourceGroupNames string[]
 
@@ -24,29 +27,8 @@ param checkGuestAgent bool
 @description('VM names to exclude.')
 param excludedVmNames string[]
 
-@description('Create the role assignments for the managed identity of the rule.')
-param deployRoleAssignments bool
-
-@description('Subscription of the cluster resource group.')
-param clusterSubscriptionId string
-
-@description('Resource group with the Azure Local VMs.')
-param clusterResourceGroupName string
-
-@description('Subscription of the workspace.')
-param workspaceSubscriptionId string
-
-@description('Resource group of the workspace.')
-param workspaceResourceGroupName string
-
-@description('Name of the workspace.')
-param workspaceName string
-
 @description('Tags.')
 param tags object = {}
-
-var readerRoleId = 'acdd72a7-3385-48ef-bd42-f606fba81ae7'
-var logAnalyticsReaderRoleId = '73c42c96-874c-492b-b04d-ab87d138a893'
 
 var resourceGroupList = join(map(resourceGroupNames, rg => '\'${toLower(rg)}\''), ', ')
 var powerStateList = join(map(alertPowerStates, s => '\'${s}\''), ', ')
@@ -64,7 +46,10 @@ resource vmStateAlert 'Microsoft.Insights/scheduledQueryRules@2023-12-01' = {
   tags: tags
   kind: 'LogAlert'
   identity: {
-    type: 'SystemAssigned'
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${identityId}': {}
+    }
   }
   properties: {
     displayName: 'Azure Local - VM state'
@@ -77,7 +62,7 @@ resource vmStateAlert 'Microsoft.Insights/scheduledQueryRules@2023-12-01' = {
     evaluationFrequency: 'PT15M'
     windowSize: 'PT15M'
     autoMitigate: true
-    // The managed identity gets its roles after the rule exists, and the deploying user may
+    // The alert identity may still be waiting for its role assignments, and the deploying user may
     // not see the VMs through Resource Graph, so skip validation at deployment time.
     skipQueryValidation: true
     criteria: {
@@ -117,29 +102,3 @@ resource vmStateAlert 'Microsoft.Insights/scheduledQueryRules@2023-12-01' = {
     }
   }
 }
-
-// Reader on the VM resource group: Resource Graph only returns what the identity can read.
-module clusterReader 'role-assignment-rg.bicep' = if (deployRoleAssignments) {
-  name: take('ra-reader-${uniqueString(vmStateAlert.id)}', 64)
-  scope: resourceGroup(clusterSubscriptionId, clusterResourceGroupName)
-  params: {
-    principalId: vmStateAlert.identity.principalId
-    roleDefinitionId: readerRoleId
-    assignmentDescription: 'Azure Local VM state alert: read VM resources via Resource Graph.'
-  }
-}
-
-// Log Analytics Reader on the workspace: the rule runs its query through the workspace.
-module workspaceReader 'role-assignment-workspace.bicep' = if (deployRoleAssignments) {
-  name: take('ra-lareader-${uniqueString(vmStateAlert.id)}', 64)
-  scope: resourceGroup(workspaceSubscriptionId, workspaceResourceGroupName)
-  params: {
-    workspaceName: workspaceName
-    principalId: vmStateAlert.identity.principalId
-    roleDefinitionId: logAnalyticsReaderRoleId
-    assignmentDescription: 'Azure Local VM state alert: run log search alert queries.'
-  }
-}
-
-@description('Principal ID of the managed identity of the alert rule.')
-output principalId string = vmStateAlert.identity.principalId

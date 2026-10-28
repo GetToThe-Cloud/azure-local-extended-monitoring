@@ -14,7 +14,7 @@
     are not reachable, put the script on a Cluster Shared Volume (or copy it to every node
     yourself), pass that folder as TargetFolder and use -SkipCopy.
 
-    Written to run in Constrained Language Mode (Application Control/WDAC enforced on Azure Local).
+    Written to also run in Constrained Language Mode (for example under a strict App Control policy).
 
 .PARAMETER ScriptSource
     Path to Watch-AzLocalVmState.ps1.
@@ -115,4 +115,4 @@ Write-Host ''
 Write-Host 'Next steps:' -ForegroundColor Cyan
 Write-Host "  - Test once by hand on a node: & '$scriptPath' -Verbose"
 Write-Host "  - Check Event Viewer > Windows Logs > Application, source $EventSource (4100 every run, 4101 per VM with a problem)"
-Write-Host '  - Check in Task Scheduler under which account the task runs; it needs local admin rights (Get-VM, event source).'
+Write-Host "  - After 10 minutes, on every node: Get-ScheduledTask -TaskName '$TaskName' | Get-ScheduledTaskInfo (LastTaskResult 0). The task runs as SYSTEM."

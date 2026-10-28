@@ -76,7 +76,7 @@ param deployEventAlerts = true
 param deployHeartbeatAlert = true
 param deployResourceHealthAlert = true
 param deployVmStateAlert = true
-param deployVmStateRoleAssignments = true
+param deployAlertRoleAssignments = true // roles for the alert identity; needs roleAssignments/write
 param deployAmaExtension = false
 param deployHealthAlertsExtension = false
 

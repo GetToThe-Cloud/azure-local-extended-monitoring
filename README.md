@@ -14,7 +14,8 @@ Bicep-set die de alerting rond een of meer Azure Local clusters neerzet: routing
 | Cluster event alerts | `Microsoft.Insights/scheduledQueryRules` | Sev1: 1135, 1177, 5120, 5142. Sev2: 1069, 1205, 1254, 18590 | 1 / 2 |
 | Node heartbeat | `Microsoft.Insights/scheduledQueryRules` | Node stuurt geen AMA-heartbeat meer (ook als een node helemaal uit de workspace verdwijnt) | 1 |
 | Arc resource bridge | `Microsoft.Insights/activityLogAlerts` (Resource Health) | Bridge Unavailable of Degraded | n.v.t. |
-| VM state (Azure Local VM's) | `Microsoft.Insights/scheduledQueryRules` + managed identity + 2 role assignments | Arc-VM's in Stopped/Unknown/Paused/Saved, Failed provisioning, optioneel guest agent niet Connected | 2 |
+| Alert identity | `Microsoft.ManagedIdentity/userAssignedIdentities` + 2 role assignments | Eén identity waarmee alle log search alerts hun query draaien: Log Analytics Reader op de workspace, Reader op de cluster-RG (voor Resource Graph) | n.v.t. |
+| VM state (Azure Local VM's) | `Microsoft.Insights/scheduledQueryRules` | Arc-VM's in Stopped/Unknown/Paused/Saved, Failed provisioning, optioneel guest agent niet Connected | 2 |
 | VM state per node (alle VM's) | `Microsoft.Insights/scheduledQueryRules` | Aantal VM's per node in Failed/Paused/Suspended/Unknown, uit SDDC-event 3000 (geen installatie, geen VM-namen) | 2 |
 | VM state per VM (alle VM's) | `Microsoft.Insights/scheduledQueryRules` + extra XPath in de DCR | Elke VM die niet Running of Off is, of een cluster-rol in Failed/PartialOnline/Pending, met VM-naam. Vereist de clustered scheduled task | 2 |
 | VM state monitor watchdog | `Microsoft.Insights/scheduledQueryRules` | De scheduled task rapporteert niet meer op een node | 3 |
@@ -35,7 +36,8 @@ modules/
   event-log-alerts.bicep           Log alerts op cluster events
   heartbeat-alert.bicep
   resource-health-alert.bicep
-  vm-state-alert.bicep             Resource Graph alert + role assignments (Azure Local VM's)
+  alert-identity.bicep             User-assigned identity voor alle log search alerts
+  vm-state-alert.bicep             Resource Graph alert (Azure Local VM's)
   vm-host-state-alerts.bicep       VM state op de hosts (alle VM's): SDDC-telling, per-VM events, watchdog
   role-assignment-rg.bicep
   role-assignment-workspace.bicep
@@ -52,7 +54,7 @@ scripts/
 - Insights staat aan op de clusters (AMA op de nodes, `AzureStackHCI-` DCR, Log Analytics workspace). Inschakelen via de portal of de Azure Policy-initiative voor Insights.
 - De `AzureEdgeTelemetryAndDiagnostics` extension is geïnstalleerd (Azure-managed, standaard aanwezig). Die levert de platform metrics.
 - Health alerts staan aan op de clusters (Capabilities > Health alerts), of gebruik `deployHealthAlertsExtension` (zie hieronder).
-- Rechten: Contributor op de monitoring-RG en de cluster-RG (DCR-koppelingen, extensions) en Monitoring Contributor op de workspace. Voor de VM state alert ook Owner of User Access Administrator, voor de twee role assignments. Zet anders `deployVmStateRoleAssignments = false` en laat iemand anders de rollen toekennen.
+- Rechten: Contributor op de monitoring-RG en de cluster-RG (DCR-koppelingen, extensions) en Monitoring Contributor op de workspace. Voor de twee role assignments van de alert identity ook Owner, User Access Administrator of Role Based Access Control Administrator op de workspace en de cluster-RG. Heb je die niet, dan zet het deploy-script de role assignments uit en print het de commando's voor iemand die ze wel heeft.
 - Az PowerShell (Az.Accounts, Az.Resources, voor de data flow-checks ook Az.OperationalInsights) en de Bicep CLI. Of Azure CLI 2.53 of nieuwer met Bicep voor handmatig uitrollen.
 
 `Deploy-AzLocalMonitoring.ps1` controleert al deze vereisten en herstelt wat automatisch kan (zie hieronder).
@@ -90,7 +92,7 @@ Wat het script doet:
 | Arc resource bridge | Aanwezig en Running | n.v.t. (Warning) |
 | Monitoring-RG | Bestaat | Aangemaakt in de regio van de workspace (of `-Location`) |
 | Resource providers | `Microsoft.Insights`, `Microsoft.AlertsManagement`, `Microsoft.OperationalInsights` | Geregistreerd |
-| Rechten | Effectieve rechten (ook via groepen en PIM) per scope, op basis van welke onderdelen aan staan | Geen `roleAssignments/write`: role assignments uit, het script print daarna de commando's voor een Owner |
+| Rechten | Effectieve rechten (ook via groepen en PIM) per scope, op basis van welke onderdelen aan staan | Geen `roleAssignments/write`: de role assignments van de alert identity gaan uit en het script print daarna de commando's voor een Owner. Tot die zijn uitgevoerd gaat geen enkele log search alert af |
 | Data flow | Heartbeat van alle nodes, SDDC-events, events van de VM state monitor | n.v.t. (Warning) |
 | Cluster nodes | Alleen met `-ConfigureClusterNodes` | Health Service-instellingen en de VM state task via remoting |
 
@@ -100,8 +102,8 @@ Daarna toont het script de Azure what-if en vraagt het om bevestiging. Met `-For
 
 Opmerkingen:
 - De rechtencheck gebruikt de Azure permissions-API. Deny assignments worden niet meegenomen.
-- `-ConfigureClusterNodes` kopieert de scripts als tekst naar `C:\ProgramData\AzLocalMonitoring` op elke node. `Copy-Item -ToSession` werkt namelijk niet tegen endpoints in Constrained Language Mode.
-- De node-scripts gebruiken `-DryRun` in plaats van `-WhatIf`. `$PSCmdlet.ShouldProcess` is in Constrained Language Mode niet gegarandeerd beschikbaar.
+- `-ConfigureClusterNodes` kopieert de scripts als tekst naar `C:\ProgramData\AzLocalMonitoring` op elke node. Zo hangt het niet af van wat een endpoint in Constrained Language Mode toestaat; `Copy-Item -ToSession` is daar niet betrouwbaar.
+- De node-scripts gebruiken `-DryRun` in plaats van `-WhatIf`. Zo zijn ze niet afhankelijk van `$PSCmdlet.ShouldProcess` als PowerShell in Constrained Language Mode draait.
 
 ## Handmatig uitrollen met Azure CLI
 
@@ -148,7 +150,7 @@ Opmerkingen:
    .\scripts\Register-AzLocalVmStateTask.ps1 -DryRun
    .\scripts\Register-AzLocalVmStateTask.ps1 -ExcludedVmNames 'template-w2022,lab-vm01'
    ```
-   Dit kopieert `Watch-AzLocalVmState.ps1` naar `C:\ProgramData\AzLocalMonitoring` op elke node en registreert een clustered scheduled task (ClusterWide, elke 5 minuten). Test het script één keer met de hand (`-Verbose`) en controleer onder welk account de taak draait. Het script heeft lokale admin-rechten nodig voor `Get-VM` en voor het aanmaken van de event source. Na ongeveer 15 minuten:
+   Dit kopieert `Watch-AzLocalVmState.ps1` naar `C:\ProgramData\AzLocalMonitoring` op elke node en registreert een clustered scheduled task (ClusterWide, elke 5 minuten). Test het script één keer met de hand (`-Verbose`). De taak zelf draait als SYSTEM: clustered scheduled tasks draaien altijd onder dat account, dus je hebt geen serviceaccount nodig. Na ongeveer 15 minuten:
    ```kusto
    Event
    | where TimeGenerated > ago(1h)
@@ -173,6 +175,7 @@ Hyper-V schrijft zelf geen event "VM staat al 10 minuten op Paused". De event lo
 ## Ontwerpkeuzes
 
 - **Eén routingpad voor cluster-alerts.** Health alerts hebben geen eigen alert rule. Je kunt er alleen op notificeren via een alert processing rule op de cluster-resource. Daarom hebben de metric alert rules bewust geen eigen action group: dezelfde processing rule routeert ze, dus geen dubbele mails. Log-, heartbeat-, VM state- en Resource Health-alerts hebben wel een directe action group, want die targeten de workspace of de bridge.
+- **Eén managed identity voor alle log search alerts.** Een log search alert zonder identity draait met de rechten van degene die hem het laatst heeft opgeslagen. Verloopt een PIM-activatie, vertrekt een collega of verandert de pipeline-principal, dan stoppen de rules zonder melding. Daarom draaien alle log search alerts als de user-assigned identity `<namePrefix>-id-alert-rules`, met Log Analytics Reader op de workspace en Reader op de cluster-RG. De rules slaan de query-validatie bij het aanmaken over, omdat een nieuwe role assignment een paar minuten nodig heeft om actief te worden. De testprocedure hieronder vangt een foute query op.
 - **Aparte DCR in plaats van de Insights-DCR aanpassen.** AMA ondersteunt meerdere DCR's per machine. De `AzureStackHCI-` DCR blijft zo zoals Insights hem beheert. Je voorkomt ook dat een Insights-update je wijzigingen overschrijft of dat Insights "Needs update" gaat tonen.
 - **N-1 geheugen.** Met `memoryPercentNMinusOne = 0` berekent de template de drempel als (N-1)/N × 100. Dat is 50% bij 2 nodes, 66% bij 3 en 75% bij 4. Boven die waarde kan het cluster een node-uitval of een drain voor patching niet meer opvangen zonder overcommit. Het is een warning met een venster van 1 uur, naast de harde 90%-alert.
 - **Latency in seconden.** De Azure Local metrics rapporteren latency in seconden. De template rekent de milliseconden uit de parameters om. Microsofts recommended alert gebruikt 500 ms; deze template gebruikt standaard 50 ms voor CSV's.
@@ -192,7 +195,8 @@ Hyper-V schrijft zelf geen event "VM staat al 10 minuten op Paused". De event lo
   Vul die in bij `healthAlertsExtensionPublisher` en `healthAlertsExtensionType`, dan kun je de extension voor volgende clusters via Bicep uitrollen.
 - **Event ID's.** De cluster events (1069, 1135, 1177, 1205, 1254, 5120, 5142) zijn standaard Windows Server failover cluster events. Controleer 18590 (guest OS crash, Hyper-V-Worker-Admin) op je eigen nodes voordat je er op pagineert. Alle ID's zijn parameters.
 - **Node-namen.** De heartbeat-alert en de event-alerts vergelijken op de korte hostnaam (`Computer` tot de eerste punt, lowercase). Gebruik in `nodeNames` de Arc machine-namen. Die zijn bij Azure Local gelijk aan de hostnamen.
-- **Application Control (WDAC).** Op Azure Local draait onondertekende PowerShell standaard in Constrained Language Mode. `Watch-AzLocalVmState.ps1` en `Register-AzLocalVmStateTask.ps1` gebruiken daarom geen .NET-aanroepen, type casts of classes. Wil je het script in Full Language Mode draaien, onderteken het dan met een certificaat dat je App Control-policy toestaat.
+- **Application Control (WDAC).** Nieuwe Azure Local-deployments draaien Application Control in Enforced mode. De base policy van Microsoft heeft script enforcement op dit moment uitgeschakeld, maar een strengere eigen policy kan onondertekende PowerShell in Constrained Language Mode zetten. `Watch-AzLocalVmState.ps1` en `Register-AzLocalVmStateTask.ps1` gebruiken daarom geen .NET-aanroepen, type casts of classes. Wil je het script in Full Language Mode draaien, onderteken het dan met een certificaat dat je App Control-policy toestaat.
 - **SDDC-event structuur.** De query op event 3000 gaat uit van de JSON-structuur die Microsoft documenteert (`m_servers[].m_vm.m_totalVms<Status>`). Controleer de query eerst in je workspace. Hyper-V's status "Saved" komt in deze telling vermoedelijk terug als Suspended.
+- **Overstap van een eerdere versie.** Eerdere versies gaven alleen `azl-vm-state` een system-assigned identity. Na deze deployment blijven de role assignments daarvan achter als "Identity not found" op de workspace en de cluster-RG (beschrijving begint met `Azure Local VM state alert:`). Die kun je verwijderen onder **Access control (IAM) > Role assignments**. In je eigen `main.bicepparam` heet `deployVmStateRoleAssignments` nu `deployAlertRoleAssignments`; de oude naam werkt nog.
 - **Resource Graph in log alerts.** Een rule met `arg("")` vereist een managed identity. Per identity kunnen maximaal 50 van dit soort rules draaien. Cross-service queries geven maximaal 1.000 rijen terug.
 - **Validatie.** De template is niet tegen een live omgeving uitgerold. Draai altijd eerst `what-if`.

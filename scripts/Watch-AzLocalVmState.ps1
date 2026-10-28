@@ -16,8 +16,8 @@
     - Event 4101 (Warning): one event per VM with a problem. The message is JSON.
     - Event 4102 (Error): the script itself failed.
 
-    Written to run in Constrained Language Mode (Application Control/WDAC enforced on Azure
-    Local): no .NET calls, no type casts, no classes.
+    Written to also run in Constrained Language Mode (for example under a strict App Control
+    policy): no .NET calls, no type casts, no classes.
 
 .PARAMETER EventSource
     Event source in the Application log. Must match vmHostStateEventSource in the Bicep template.

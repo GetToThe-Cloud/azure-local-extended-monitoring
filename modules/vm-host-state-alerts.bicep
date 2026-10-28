@@ -12,6 +12,9 @@ param workspaceId string
 @description('Resource ID of the action group.')
 param actionGroupId string
 
+@description('Resource ID of the user-assigned managed identity the rule runs its query with.')
+param identityId string
+
 @description('Arc machine names (host names) of all nodes.')
 param nodeNames string[]
 
@@ -48,6 +51,12 @@ resource sddcAlert 'Microsoft.Insights/scheduledQueryRules@2023-12-01' = if (dep
   location: location
   tags: tags
   kind: 'LogAlert'
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${identityId}': {}
+    }
+  }
   properties: {
     displayName: 'Azure Local - VMs in abnormal state (per node)'
     description: 'One or more VMs on an Azure Local node are Failed, Paused, Suspended/Saved or Unknown according to the latest SDDC Management snapshot (event 3000).'
@@ -60,6 +69,9 @@ resource sddcAlert 'Microsoft.Insights/scheduledQueryRules@2023-12-01' = if (dep
     // Wide window so the latest snapshot is always included, also with the default 60 minute interval.
     windowSize: 'PT2H'
     autoMitigate: true
+    // Validation at creation would run as the alert identity, whose role assignment can take a few
+    // minutes to propagate. The queries are covered by the test procedure in the README instead.
+    skipQueryValidation: true
     criteria: {
       allOf: [
         {
@@ -98,6 +110,12 @@ resource scriptVmAlert 'Microsoft.Insights/scheduledQueryRules@2023-12-01' = if 
   location: location
   tags: tags
   kind: 'LogAlert'
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${identityId}': {}
+    }
+  }
   properties: {
     displayName: 'Azure Local - VM not Running or Off'
     description: 'A VM on Azure Local is in a state other than Running or Off (for example Paused, PausedCritical, Saved, Starting/Stopping for too long) or its cluster role is Failed, PartialOnline or Pending.'
@@ -109,6 +127,9 @@ resource scriptVmAlert 'Microsoft.Insights/scheduledQueryRules@2023-12-01' = if 
     evaluationFrequency: 'PT5M'
     windowSize: 'PT15M'
     autoMitigate: true
+    // Validation at creation would run as the alert identity, whose role assignment can take a few
+    // minutes to propagate. The queries are covered by the test procedure in the README instead.
+    skipQueryValidation: true
     criteria: {
       allOf: [
         {
@@ -153,6 +174,12 @@ resource scriptRunAlert 'Microsoft.Insights/scheduledQueryRules@2023-12-01' = if
   location: location
   tags: tags
   kind: 'LogAlert'
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${identityId}': {}
+    }
+  }
   properties: {
     displayName: 'Azure Local - VM state monitor not running'
     description: 'Watch-AzLocalVmState.ps1 has not reported for more than ${scriptMaxSilenceMinutes} minutes on a node (task not installed, disabled, failing, or node down).'
@@ -164,6 +191,9 @@ resource scriptRunAlert 'Microsoft.Insights/scheduledQueryRules@2023-12-01' = if
     evaluationFrequency: 'PT15M'
     windowSize: 'PT1H'
     autoMitigate: true
+    // Validation at creation would run as the alert identity, whose role assignment can take a few
+    // minutes to propagate. The queries are covered by the test procedure in the README instead.
+    skipQueryValidation: true
     criteria: {
       allOf: [
         {

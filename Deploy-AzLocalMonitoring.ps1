@@ -23,8 +23,9 @@
       Azure          Monitoring resource group (created if missing), resource providers
                      (registered if missing)
       Permissions    Effective permissions of the signed-in identity on every scope the deployment
-                     writes to. Missing roleAssignments/write disables the role assignments of the
-                     VM state alert and prints the commands for someone who has the rights.
+                     writes to. All log search alerts run as one user-assigned identity; missing
+                     roleAssignments/write disables its role assignments and prints the commands
+                     for someone who has the rights.
       Data flow      Heartbeat, SDDC Management events and VM state monitor events in the workspace
                      (requires Az.OperationalInsights)
       Cluster nodes  With -ConfigureClusterNodes: Health Service settings and the VM state
@@ -32,6 +33,14 @@
 
     Any check with status Fail stops the script before the deployment. Otherwise the script
     shows an Azure what-if, asks for confirmation (unless -Force) and deploys.
+
+    The deployment runs in two phases when the alert identity or its role assignments are new.
+    Phase 1 deploys everything except the log search alert rules. The script then waits until
+    the role assignments are -RolePropagationMinutes old, because the Log Search Alerts service
+    checks the identity's access when a rule is saved and rejects it with "The provided
+    credentials have insufficient access" while a new assignment is still propagating. Phase 2
+    deploys the full template and retries that specific error. When the role assignments
+    already exist, the script skips straight to phase 2.
 
     -WhatIf runs all checks, shows what would be fixed and the Azure what-if, and changes nothing.
 
@@ -71,6 +80,11 @@
 
 .PARAMETER SkipDataFlowChecks
     Skip the queries against the Log Analytics workspace.
+
+.PARAMETER RolePropagationMinutes
+    How old a role assignment of the alert identity must be before the log search alert rules
+    are deployed. Default 5. Phase 2 also retries up to three times, three minutes apart, when
+    the Log Search Alerts service still reports insufficient access.
 
 .PARAMETER Force
     Deploy without asking for confirmation after the what-if.
@@ -113,6 +127,9 @@ param(
 
     [switch] $SkipDataFlowChecks,
 
+    [ValidateRange(0, 60)]
+    [int] $RolePropagationMinutes = 5,
+
     [switch] $Force
 )
 
@@ -132,12 +149,27 @@ $ApiVersions = @{
     Permissions = '2022-04-01'
     Resources   = '2021-04-01'
     QueryRules  = '2023-12-01'
+    Identity    = '2023-01-31'
+    RoleAssign  = '2022-04-01'
 }
 
 $RoleIds = @{
     Reader             = 'acdd72a7-3385-48ef-bd42-f606fba81ae7'
     LogAnalyticsReader = '73c42c96-874c-492b-b04d-ab87d138a893'
 }
+
+# Roles that give the alert identity the read access it needs. Any of them, at the scope or above, counts.
+$ReadRoleIds = @(
+    'acdd72a7-3385-48ef-bd42-f606fba81ae7' # Reader
+    '73c42c96-874c-492b-b04d-ab87d138a893' # Log Analytics Reader
+    '92aaf0da-9dab-42b6-94a3-d43ce8d16293' # Log Analytics Contributor
+    'b24988ac-6180-42a0-ab88-20f7382dd24c' # Contributor
+    '8e3af657-a8ff-443c-a75c-2fe8c4bcb635' # Owner
+)
+
+# Phase 2 retries when the Log Search Alerts service still rejects the identity
+$RuleDeployAttempts = 3
+$RuleRetryMinutes = 3
 
 $ExtensionNames = @{
     Telemetry   = 'AzureEdgeTelemetryAndDiagnostics'
@@ -348,6 +380,82 @@ function Invoke-WorkspaceQuery {
     param([string] $WorkspaceCustomerId, [string] $Query)
     $response = Invoke-AzOperationalInsightsQuery -WorkspaceId $WorkspaceCustomerId -Query $Query -ErrorAction Stop
     return @($response.Results)
+}
+
+function Get-IdentityPrincipalId {
+    # Principal ID of a user-assigned identity, or $null when it does not exist yet.
+    param([Parameter(Mandatory)] [string] $IdentityId)
+    $identity = Invoke-Arm -Path "$($IdentityId)?api-version=$($ApiVersions.Identity)"
+    if ($identity -and $identity.properties.principalId) { return "$($identity.properties.principalId)" }
+    return $null
+}
+
+function Test-ScopeCovers {
+    # True when a role assignment at $AssignmentScope applies to $TargetScope (same scope or a parent).
+    param([string] $AssignmentScope, [string] $TargetScope)
+    $assignment = $AssignmentScope.TrimEnd('/').ToLowerInvariant()
+    $target = $TargetScope.TrimEnd('/').ToLowerInvariant()
+    if ($assignment -eq '') { return $true }
+    return ($target -eq $assignment) -or $target.StartsWith("$assignment/")
+}
+
+function Get-IdentityRoleState {
+    # For every requirement: is a read role assigned to the principal at that scope or above, and since when (UTC).
+    param(
+        [Parameter(Mandatory)] [string] $PrincipalId,
+        [Parameter(Mandatory)] [object[]] $Requirements
+    )
+    $state = @()
+    foreach ($requirement in $Requirements) {
+        $path = "$($requirement.Scope)/providers/Microsoft.Authorization/roleAssignments?api-version=$($ApiVersions.RoleAssign)&`$filter=principalId%20eq%20'$PrincipalId'"
+        $assignments = @()
+        $response = Invoke-Arm -Path $path
+        if ($response -and $response.value) { $assignments = @($response.value) }
+
+        $since = $null
+        foreach ($assignment in $assignments) {
+            $roleId = ("$($assignment.properties.roleDefinitionId)" -split '/')[-1]
+            if ($ReadRoleIds -notcontains $roleId) { continue }
+            if (-not (Test-ScopeCovers -AssignmentScope "$($assignment.properties.scope)" -TargetScope $requirement.Scope)) { continue }
+
+            $created = [datetime]::MinValue
+            if ($assignment.properties.createdOn) {
+                $created = ([datetime]$assignment.properties.createdOn).ToUniversalTime()
+            }
+            if ($null -eq $since -or $created -lt $since) { $since = $created }
+        }
+
+        $state += [pscustomobject]@{
+            Label    = $requirement.Label
+            Scope    = $requirement.Scope
+            RoleId   = $requirement.RoleId
+            Assigned = ($null -ne $since)
+            Since    = $since
+        }
+    }
+    return $state
+}
+
+function Wait-Until {
+    # Waits until a UTC point in time, with a progress bar.
+    param([Parameter(Mandatory)] [datetime] $UntilUtc, [string] $Activity)
+    $total = ($UntilUtc - (Get-Date).ToUniversalTime()).TotalSeconds
+    while ($true) {
+        $left = ($UntilUtc - (Get-Date).ToUniversalTime()).TotalSeconds
+        if ($left -le 0) { break }
+        $percent = 0
+        if ($total -gt 0) { $percent = [int][math]::Min(100, [math]::Max(0, 100 * ($total - $left) / $total)) }
+        Write-Progress -Activity $Activity -Status ("{0}:{1:00} left" -f [int][math]::Floor($left / 60), [int][math]::Floor($left % 60)) -PercentComplete $percent
+        Start-Sleep -Seconds ([int][math]::Min(15, [math]::Ceiling($left)))
+    }
+    Write-Progress -Activity $Activity -Completed
+}
+
+function Write-RoleAssignmentCommand {
+    param([string] $PrincipalId, [object[]] $RoleState)
+    foreach ($role in @($RoleState | Where-Object { -not $_.Assigned })) {
+        Write-Host "  New-AzRoleAssignment -ObjectId $PrincipalId -ObjectType ServicePrincipal -RoleDefinitionId $($role.RoleId) -Scope $($role.Scope)"
+    }
 }
 
 function Show-Summary {
@@ -768,6 +876,7 @@ try {
     $providerChecks = @(
         @{ Subscription = $deploySubscriptionId; Namespace = 'Microsoft.Insights' }
         @{ Subscription = $deploySubscriptionId; Namespace = 'Microsoft.AlertsManagement' }
+        @{ Subscription = $deploySubscriptionId; Namespace = 'Microsoft.ManagedIdentity' }
         @{ Subscription = $clusterSubscriptionId; Namespace = 'Microsoft.Insights' }
         @{ Subscription = $workspaceSubscriptionId; Namespace = 'Microsoft.OperationalInsights' }
     )
@@ -815,46 +924,60 @@ try {
     # ------------------------------------------------------------------------
 
     $deployVmStateAlert = Get-BoolSetting 'deployVmStateAlert' $true
-    $deployRoleAssignments = $deployVmStateAlert -and (Get-BoolSetting 'deployVmStateRoleAssignments' $true)
-
-    # Role assignments first: missing rights disable them instead of blocking the deployment.
-    if ($deployRoleAssignments) {
-        $missingRoleRights = @()
-        $missingRoleRights += Get-MissingAction -Scope $clusterResourceGroupId -Actions @('Microsoft.Authorization/roleAssignments/write')
-        $missingRoleRights += Get-MissingAction -Scope $workspaceResourceId -Actions @('Microsoft.Authorization/roleAssignments/write')
-
-        if ($missingRoleRights.Count -gt 0) {
-            $deployRoleAssignments = $false
-            $script:ManualRoleAssignments = $true
-            $script:Overrides['deployVmStateRoleAssignments'] = $false
-            Add-Result 'Permissions' 'Role assignments' 'Warning' 'no roleAssignments/write on the cluster resource group and/or workspace: the VM state alert is deployed without its role assignments, the commands for an Owner are printed after the deployment'
-        }
-        else {
-            Add-Result 'Permissions' 'Role assignments' 'Pass' 'roleAssignments/write on cluster resource group and workspace'
-        }
-    }
-
     $deployEventCollection = Get-BoolSetting 'deployEventCollection' $true
     $deployExtensions = (Get-BoolSetting 'deployAmaExtension' $false) -or (Get-BoolSetting 'deployHealthAlertsExtension' $false)
     $deployLogAlerts = (Get-BoolSetting 'deployEventAlerts' $true) -or (Get-BoolSetting 'deployHeartbeatAlert' $true) -or $deployVmStateAlert -or (Get-BoolSetting 'deployVmHostStateSddcAlert' $true) -or (Get-BoolSetting 'deployVmHostStateScript' $true)
 
+    # All log search alerts run as one user-assigned identity. It needs Log Analytics Reader on the
+    # workspace, and Reader on the cluster resource group for the Resource Graph VM state alert.
+    $deployRoleAssignments = $deployLogAlerts -and (Get-BoolSetting 'deployAlertRoleAssignments' $true) -and (Get-BoolSetting 'deployVmStateRoleAssignments' $true)
+    $deployClusterRoleAssignment = $deployRoleAssignments -and $deployVmStateAlert
+
+    if ($deployLogAlerts -and -not $deployRoleAssignments) {
+        $script:ManualRoleAssignments = $true
+        Add-Result 'Permissions' 'Role assignments' 'Info' 'disabled in the parameters: the commands for the alert identity are printed after the deployment'
+    }
+
+    # Role assignments first: missing rights disable them instead of blocking the deployment.
+    if ($deployRoleAssignments) {
+        $missingRoleRights = @()
+        $missingRoleRights += Get-MissingAction -Scope $workspaceResourceId -Actions @('Microsoft.Authorization/roleAssignments/write')
+        if ($deployClusterRoleAssignment) {
+            $missingRoleRights += Get-MissingAction -Scope $clusterResourceGroupId -Actions @('Microsoft.Authorization/roleAssignments/write')
+        }
+
+        if ($missingRoleRights.Count -gt 0) {
+            $deployRoleAssignments = $false
+            $deployClusterRoleAssignment = $false
+            $script:ManualRoleAssignments = $true
+            $script:Overrides['deployAlertRoleAssignments'] = $false
+            Add-Result 'Permissions' 'Role assignments' 'Warning' 'no roleAssignments/write on the workspace and/or cluster resource group: the alert identity is deployed without roles, so no log search alert can read the workspace until an Owner runs the commands printed after the deployment'
+        }
+        else {
+            Add-Result 'Permissions' 'Role assignments' 'Pass' 'roleAssignments/write for the alert identity on the workspace and cluster resource group'
+        }
+    }
+
     $monitoringScope = $monitoringResourceGroupId
-    $monitoringActions = @('Microsoft.Resources/deployments/write', 'Microsoft.Insights/actionGroups/write')
+    $monitoringActions = @('Microsoft.Resources/deployments/write', 'Microsoft.Insights/actionGroups/write', 'Microsoft.ManagedIdentity/userAssignedIdentities/write')
     if (-not $monitoringResourceGroupExists) {
         $monitoringScope = "/subscriptions/$deploySubscriptionId"
         $monitoringActions += 'Microsoft.Resources/subscriptions/resourceGroups/write'
     }
     if (Get-BoolSetting 'deployHealthAlertRouting' $true) { $monitoringActions += 'Microsoft.AlertsManagement/actionRules/write' }
     if ($deployMetricAlerts) { $monitoringActions += 'Microsoft.Insights/metricAlerts/write' }
-    if ($deployLogAlerts) { $monitoringActions += 'Microsoft.Insights/scheduledQueryRules/write' }
+    if ($deployLogAlerts) {
+        $monitoringActions += 'Microsoft.Insights/scheduledQueryRules/write'
+        $monitoringActions += 'Microsoft.ManagedIdentity/userAssignedIdentities/assign/action'
+    }
     if (Get-BoolSetting 'deployResourceHealthAlert' $true) { $monitoringActions += 'Microsoft.Insights/activityLogAlerts/write' }
     if ($deployEventCollection) { $monitoringActions += 'Microsoft.Insights/dataCollectionRules/write' }
 
     $clusterActions = @('Microsoft.AzureStackHCI/clusters/read', 'Microsoft.HybridCompute/machines/read')
-    if ($deployEventCollection -or $deployExtensions -or $deployRoleAssignments) { $clusterActions += 'Microsoft.Resources/deployments/write' }
+    if ($deployEventCollection -or $deployExtensions -or $deployClusterRoleAssignment) { $clusterActions += 'Microsoft.Resources/deployments/write' }
     if ($deployEventCollection) { $clusterActions += 'Microsoft.Insights/dataCollectionRuleAssociations/write' }
     if ($deployExtensions) { $clusterActions += 'Microsoft.AzureStackHCI/clusters/arcSettings/extensions/write' }
-    if ($deployRoleAssignments) { $clusterActions += 'Microsoft.Authorization/roleAssignments/write' }
+    if ($deployClusterRoleAssignment) { $clusterActions += 'Microsoft.Authorization/roleAssignments/write' }
 
     $workspaceActions = @('Microsoft.OperationalInsights/workspaces/read')
     if ($deployRoleAssignments) { $workspaceActions += 'Microsoft.Authorization/roleAssignments/write' }
@@ -989,8 +1112,8 @@ Event
             try {
                 $sessions = @(New-PSSession @sessionParameters)
 
-                # Copy the scripts as text: Copy-Item -ToSession does not work against
-                # Constrained Language Mode endpoints (Application Control on Azure Local).
+                # Copy the scripts as text with Set-Content, so this does not depend on what a
+                # Constrained Language Mode endpoint allows (Copy-Item -ToSession is unreliable there).
                 foreach ($session in $sessions) {
                     foreach ($scriptName in $localScripts.Keys) {
                         Invoke-Command -Session $session -ScriptBlock {
@@ -1096,22 +1219,122 @@ Event
         return
     }
 
-    $deployment = New-AzResourceGroupDeployment @deploymentRequest -Name $DeploymentName
-    if ($deployment.ProvisioningState -ne 'Succeeded') {
-        throw "Deployment $DeploymentName ended with state $($deployment.ProvisioningState)."
+    # The Log Search Alerts service checks the rule's identity when a rule is saved. A role assignment
+    # that is only seconds old is not visible to it yet and the rule is rejected with "The provided
+    # credentials have insufficient access to perform the requested operation". So when the identity
+    # or its roles are new: phase 1 without the rules, wait, phase 2 with everything.
+    $alertIdentityName = "$namePrefix-id-alert-rules"
+    $alertIdentityId = "$monitoringResourceGroupId/providers/Microsoft.ManagedIdentity/userAssignedIdentities/$alertIdentityName"
+    $identityRequirements = @(
+        @{ Label = "Log Analytics Reader on workspace $($workspace.name)"; Scope = $workspaceResourceId; RoleId = $RoleIds.LogAnalyticsReader }
+    )
+    if ($deployVmStateAlert) {
+        $identityRequirements += @{ Label = "Reader on resource group $clusterResourceGroupName"; Scope = $clusterResourceGroupId; RoleId = $RoleIds.Reader }
     }
-    Write-Host "  Deployment $DeploymentName succeeded." -ForegroundColor Green
 
-    # Role assignments for the VM state alert when the signed-in identity could not create them
-    if ($script:ManualRoleAssignments) {
-        $ruleId = "$monitoringResourceGroupId/providers/Microsoft.Insights/scheduledQueryRules/$namePrefix-vm-state"
-        $rule = Invoke-Arm -Path "$($ruleId)?api-version=$($ApiVersions.QueryRules)"
-        $principalId = "$($rule.identity.principalId)"
+    $alertIdentityPrincipalId = $null
+    $roleState = @()
+    $deployRules = $true
 
-        Write-Host ''
-        Write-Host 'Ask an Owner / User Access Administrator to run:' -ForegroundColor Yellow
-        Write-Host "  New-AzRoleAssignment -ObjectId $principalId -RoleDefinitionId $($RoleIds.Reader) -Scope $clusterResourceGroupId"
-        Write-Host "  New-AzRoleAssignment -ObjectId $principalId -RoleDefinitionId $($RoleIds.LogAnalyticsReader) -Scope $workspaceResourceId"
+    if ($deployLogAlerts) {
+        $alertIdentityPrincipalId = Get-IdentityPrincipalId -IdentityId $alertIdentityId
+        if ($alertIdentityPrincipalId) {
+            $roleState = @(Get-IdentityRoleState -PrincipalId $alertIdentityPrincipalId -Requirements $identityRequirements)
+        }
+
+        $identityReady = $alertIdentityPrincipalId -and @($roleState | Where-Object { -not $_.Assigned }).Count -eq 0
+        if ($identityReady) {
+            Write-Host "  Alert identity $alertIdentityName and its roles already exist: single deployment." -ForegroundColor Gray
+        }
+        else {
+            $phaseOneBase = $DeploymentName
+            if ($phaseOneBase.Length -gt 55) { $phaseOneBase = $phaseOneBase.Substring(0, 55) }
+            $phaseOneName = "$phaseOneBase-identity"
+            Write-Host "  Phase 1 of 2: $phaseOneName (alert identity and role assignments, no log search alert rules yet)" -ForegroundColor Cyan
+
+            $phaseOneParameters = $deploymentParameters.Clone()
+            $phaseOneParameters['deployLogAlertRules'] = $false
+            $phaseOne = New-AzResourceGroupDeployment -ResourceGroupName $ResourceGroupName -TemplateFile $templateJsonPath -TemplateParameterObject $phaseOneParameters -Name $phaseOneName
+            if ($phaseOne.ProvisioningState -ne 'Succeeded') {
+                throw "Deployment $phaseOneName ended with state $($phaseOne.ProvisioningState)."
+            }
+            Write-Host "  Deployment $phaseOneName succeeded." -ForegroundColor Green
+            $alertIdentityPrincipalId = "$($phaseOne.Outputs['alertIdentityPrincipalId'].Value)"
+
+            # The role assignment API can lag a few seconds behind the deployment
+            $listDeadline = (Get-Date).AddMinutes(2)
+            do {
+                $roleState = @(Get-IdentityRoleState -PrincipalId $alertIdentityPrincipalId -Requirements $identityRequirements)
+                $missingRoles = @($roleState | Where-Object { -not $_.Assigned })
+                if ($missingRoles.Count -eq 0 -or $script:ManualRoleAssignments) { break }
+                Start-Sleep -Seconds 10
+            } while ((Get-Date) -lt $listDeadline)
+        }
+
+        Write-Host "  Log search alerts run as managed identity $alertIdentityName (principal ID $alertIdentityPrincipalId)."
+        foreach ($role in $roleState) {
+            if ($role.Assigned) {
+                Write-Host ("  [OK]      {0} (since {1:yyyy-MM-dd HH:mm} UTC)" -f $role.Label, $role.Since) -ForegroundColor Green
+            }
+            else {
+                Write-Host "  [MISSING] $($role.Label)" -ForegroundColor Yellow
+            }
+        }
+
+        if (@($roleState | Where-Object { -not $_.Assigned }).Count -gt 0) {
+            # Only when the role assignments could not be part of the deployment (no rights, or disabled)
+            $deployRules = $false
+            Write-Host ''
+            Write-Host 'The alert identity is missing roles. Ask an Owner, User Access Administrator or RBAC Administrator to run:' -ForegroundColor Yellow
+            Write-RoleAssignmentCommand -PrincipalId $alertIdentityPrincipalId -RoleState $roleState
+            Write-Host '  The log search alert rules are not deployed or changed until then: the service rejects a rule whose identity cannot read the workspace.' -ForegroundColor Yellow
+            Write-Host "  Run this script again once the roles are assigned; it waits $RolePropagationMinutes minutes after the assignment and deploys the rules." -ForegroundColor Yellow
+        }
+        else {
+            $newest = [datetime]::MinValue
+            foreach ($role in $roleState) {
+                if ($role.Since -gt $newest) { $newest = $role.Since }
+            }
+            $readyAt = $newest.AddMinutes($RolePropagationMinutes)
+            if ($readyAt -gt (Get-Date).ToUniversalTime()) {
+                Write-Host ("  Waiting until {0:HH:mm} UTC for the role assignments to propagate ({1} minutes after the newest assignment)." -f $readyAt, $RolePropagationMinutes) -ForegroundColor Cyan
+                Wait-Until -UntilUtc $readyAt -Activity 'Waiting for the role assignments of the alert identity to propagate'
+            }
+        }
+    }
+
+    if ($deployRules) {
+        if ($deployLogAlerts -and -not $identityReady) {
+            Write-Host "  Phase 2 of 2: $DeploymentName (everything, including the log search alert rules)" -ForegroundColor Cyan
+        }
+
+        $attempt = 0
+        while ($true) {
+            $attempt++
+            try {
+                $deployment = New-AzResourceGroupDeployment @deploymentRequest -Name $DeploymentName
+                if ($deployment.ProvisioningState -ne 'Succeeded') {
+                    throw "Deployment $DeploymentName ended with state $($deployment.ProvisioningState)."
+                }
+                break
+            }
+            catch {
+                $errorText = "$($_.Exception.Message) $_"
+                if ($deployLogAlerts -and $attempt -lt $RuleDeployAttempts -and $errorText -match 'insufficient access|InsufficientAccess') {
+                    Write-Host "  Attempt $attempt of ${RuleDeployAttempts}: the Log Search Alerts service does not see the access of $alertIdentityName yet. Retrying in $RuleRetryMinutes minutes." -ForegroundColor Yellow
+                    Wait-Until -UntilUtc (Get-Date).ToUniversalTime().AddMinutes($RuleRetryMinutes) -Activity 'Waiting before the next deployment attempt'
+                    continue
+                }
+                if ($errorText -match 'insufficient access|InsufficientAccess') {
+                    Write-Host ''
+                    Write-Host "The Log Search Alerts service still rejects $alertIdentityName after $attempt attempts." -ForegroundColor Yellow
+                    Write-Host '  Check that the role assignments above exist in the portal (Access control (IAM) > Role assignments),' -ForegroundColor Yellow
+                    Write-Host '  then run the script again with a larger -RolePropagationMinutes, for example 15.' -ForegroundColor Yellow
+                }
+                throw
+            }
+        }
+        Write-Host "  Deployment $DeploymentName succeeded." -ForegroundColor Green
     }
 
     Write-Host ''

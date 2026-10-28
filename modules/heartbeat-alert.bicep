@@ -12,6 +12,9 @@ param workspaceId string
 @description('Resource ID of the action group.')
 param actionGroupId string
 
+@description('Resource ID of the user-assigned managed identity the rule runs its query with.')
+param identityId string
+
 @description('Arc machine names (host names) of all nodes.')
 param nodeNames string[]
 
@@ -29,6 +32,12 @@ resource heartbeatAlert 'Microsoft.Insights/scheduledQueryRules@2023-12-01' = {
   location: location
   tags: tags
   kind: 'LogAlert'
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${identityId}': {}
+    }
+  }
   properties: {
     displayName: 'Azure Local - node heartbeat missing'
     description: 'An Azure Local node has not sent an Azure Monitor Agent heartbeat for more than ${thresholdMinutes} minutes (node down, isolated, or agent not running).'
@@ -40,6 +49,9 @@ resource heartbeatAlert 'Microsoft.Insights/scheduledQueryRules@2023-12-01' = {
     evaluationFrequency: 'PT5M'
     windowSize: 'PT1H'
     autoMitigate: true
+    // Validation at creation would run as the alert identity, whose role assignment can take a few
+    // minutes to propagate. The queries are covered by the test procedure in the README instead.
+    skipQueryValidation: true
     criteria: {
       allOf: [
         {
