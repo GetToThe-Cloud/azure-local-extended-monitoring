@@ -5,6 +5,7 @@ A Bicep baseline that deploys the alerting around one or more Azure Local cluste
 - routing of the built-in health alerts;
 - metric alerts per cluster;
 - extra event collection with log search alerts: failover clustering, unexpected restarts, hardware errors, storage stalls, Defender attack surface reduction;
+- leftover checkpoints: an alert and a workbook for VMs that keep running on an `.avhdx`;
 - a node heartbeat alert;
 - a Resource Health alert on the Arc resource bridge;
 - alerts on the state of every VM on the cluster, both Azure Local VMs and plain Hyper-V VMs.
@@ -19,7 +20,9 @@ The background and the design choices are explained in the blog post [Azure Loca
 | Health alert routing | `Microsoft.AlertsManagement/actionRules` | Sends health alerts (AzureEdgeAlerts) and the cluster metric alerts to the action group | follows the alert |
 | Maintenance window (optional) | `Microsoft.AlertsManagement/actionRules` | Suppresses notifications during patch night | n/a |
 | Metric alerts per cluster | `Microsoft.Insights/metricAlerts` | CPU, memory (high and N-1), available memory, Storage Degraded, CSV read/write latency, VHD latency, VM memory pressure | 1 to 3 |
-| Extra event collection | `Microsoft.Insights/dataCollectionRules` + associations on all nodes | Failover clustering, Hyper-V, restart, storage, Defender ASR and WHEA hardware events to the workspace (see [Node events](#node-events)) | n/a |
+| Extra event collection | `Microsoft.Insights/dataCollectionRules` + associations on all nodes | Failover clustering, Hyper-V, restart, storage, Defender ASR and WHEA hardware events to the workspace (see [Node events](#node-events)), and the `Hyper-V Virtual Storage Device` counter for the checkpoint alert | n/a |
+| Leftover checkpoint alert | `Microsoft.Insights/scheduledQueryRules` | A VM has had a disk on an `.avhdx` for 46 hours or longer, per VM (see [Leftover checkpoints](#leftover-checkpoints)) | 2 |
+| Checkpoint workbook | `Microsoft.Insights/workbooks` | Every VM on a checkpoint now, since when, and which ones are older than `checkpointMaxAgeDays` | n/a |
 | Node event alerts | `Microsoft.Insights/scheduledQueryRules` | Sev1: FailoverClustering 1135, 1177, 5120, 5142; Kernel-Power 41; bugcheck 1001. Sev2: FailoverClustering 1069, 1126, 1127, 1129, 1130, 1205, 1254; Hyper-V-Worker 18590; StorageVSP 9; SMBServer 1020; VMMS 18012, 18014, 18016; Hyper-V-High-Availability 21502 | 1 / 2 |
 | Defender ASR alerts | `Microsoft.Insights/scheduledQueryRules` | An ASR rule that must stay in Audit is set to Block (5007), and ASR blocks (1121) | 2 |
 | Hardware error alerts | `Microsoft.Insights/scheduledQueryRules` | Fatal WHEA errors (Sev1) and corrected WHEA errors piling up on a node (Sev2) | 1 / 2 |
@@ -48,6 +51,7 @@ modules/
   event-log-alerts.bicep           Log search alerts on node events (Sev1 and Sev2)
   defender-asr-alerts.bicep        Defender ASR: rule set to Block (5007), ASR blocks (1121)
   hardware-error-alerts.bicep      WHEA hardware errors: fatal, and corrected errors piling up
+  checkpoint-alerts.bicep          Leftover checkpoints: alert and workbook
   heartbeat-alert.bicep
   resource-health-alert.bicep
   alert-identity.bicep             User-assigned identity for all log search alerts
@@ -202,8 +206,16 @@ Notes:
    | where EventLog == "Application" and Source == "AzLocalVmStateMonitor"
    | project TimeGenerated, Computer, EventID, RenderedDescription
    ```
-6. **Check the SDDC VM counts.** Run the query from `queries/vm-host-state-sddc.kql` in the workspace, with `{{INCLUDE_TRANSITIONAL}}` replaced by `false`, and compare the result with `Get-VM` on the nodes.
-7. **Test the routing.** Temporarily lower a metric alert threshold, or trigger a health fault in a test environment (for example a volume above the warning threshold). For the VM state: pause a test VM and wait 10 to 15 minutes. After a new deployment of the log search alert rules, give the first alert up to half an hour.
+6. **Check the checkpoint counter** after about 30 minutes. Every node with running VMs should send rows, and the VMs on a checkpoint show up with their `.avhdx`:
+   ```kusto
+   Perf
+   | where TimeGenerated > ago(30m)
+   | where ObjectName == "Hyper-V Virtual Storage Device"
+   | summarize Disks = dcount(InstanceName), OnCheckpoint = dcountif(InstanceName, InstanceName endswith ".avhdx") by Computer
+   ```
+   Then open the workbook **Azure Local - leftover checkpoints** and compare it with `Get-VMSnapshot` on the nodes.
+7. **Check the SDDC VM counts.** Run the query from `queries/vm-host-state-sddc.kql` in the workspace, with `{{INCLUDE_TRANSITIONAL}}` replaced by `false`, and compare the result with `Get-VM` on the nodes.
+8. **Test the routing.** Temporarily lower a metric alert threshold, or trigger a health fault in a test environment (for example a volume above the warning threshold). For the VM state: pause a test VM and wait 10 to 15 minutes. After a new deployment of the log search alert rules, give the first alert up to half an hour.
 
 ## When an alert does not fire
 
@@ -271,7 +283,7 @@ All of it is in parameters: `criticalClusterEventIds`, `warningClusterEventIds`,
 
 What is deliberately not here:
 - **6008** (the previous shutdown was unexpected). It comes with every 41, and because the alerts split per event ID you would get two alerts for one failure.
-- **Leftover checkpoints.** Hyper-V does not log the creation of a checkpoint, so a VM that keeps running on an `.avhdx` cannot be found with events.
+- **Leftover checkpoints as events.** Hyper-V does not log the creation of a checkpoint. They are found through a performance counter instead, see [Leftover checkpoints](#leftover-checkpoints).
 - **All CSVs on one node.** With `CsvBalancer` at 0, the volumes stay where they landed after a restart or failure. No event reports that; check `Get-ClusterSharedVolume` after every update, repair or failure.
 - **A failed solution update.** There is no reliable node event for it. Event 5007 on the PSExec and WMI rule is the early warning for the most common cause seen in the field; the update state itself lives in Azure.
 
@@ -280,6 +292,33 @@ What is deliberately not here:
 The Azure Local security baseline keeps the ASR rule *Block process creations originating from PSExec and WMI commands* (`d1e49aac-8f56-4280-b9ba-993a6d77406c`) in Audit. Cluster-Aware Updating starts `InstallMsuFiles.ps1` through `WmiPrvSE.exe`, exactly what that rule blocks. When an Intune or Defender for Endpoint policy targets the nodes with the rule in Block, the cloud policy wins, and the next solution update fails with `MaxFailedNodesExceeded` and exit code `0xffffffff` on the node, while Defender logs a 1121 in the same second. Microsoft describes this in the Azure Local supportability TSG *Solution update CAU run fails due to Windows Defender blocking WMI commands*.
 
 Event 5007 shows the moment a policy sets the rule to Block, often days or weeks before the update window. Event 1121 shows the block itself, but that happens during the update, which is usually inside the maintenance window. When `maintenanceWindow` suppresses notifications, you only find that alert afterwards in the portal. That makes 5007 the alert to act on.
+
+## Leftover checkpoints
+
+A checkpoint that nobody removes keeps the VM on an `.avhdx`. Every read and write goes through the extra layer, the file keeps growing, and the eventual merge gets bigger every day. Backup and replication products create a checkpoint for every job and remove it afterwards; a failed job can leave it behind. Admins forget theirs.
+
+Hyper-V does not log the creation of a checkpoint, so events do not help. The `Hyper-V Virtual Storage Device` counter does: it has one instance per virtual disk in use, named after the file, with `\` replaced by `-`:
+
+```
+\Hyper-V Virtual Storage Device(C:-ClusterStorage-UserStorage_01-e40fcbbb67a5c9d-VM01-datadisk-1-...avhdx)\Latency
+```
+
+The supplemental DCR collects `Latency` for every instance, every `checkpointCounterIntervalSeconds`. A disk that has had an `.avhdx` instance for `checkpointAlertAfterHours` is a leftover.
+
+| What | Detail |
+|---|---|
+| Alert | `<namePrefix>-checkpoint-avhdx`, Sev2, every hour, split by VM and node. Resolves by itself when the checkpoint is gone |
+| VM name | Read from the file name of the disk: `<vm>-OSdisk-...`, `<vm>-datadisk-...`, `<vm>dataDisk01...`, `<vm>-<guid>-...-OSDisk-...`. When the pattern does not match, the alert uses the full instance name, so a disk is never missed |
+| Replicas | Replica VMs are off and have no counter instance. Their restore points (also checkpoints) are left alone |
+| Exclusions | `checkpointExcludedVmNames`, for a VM that keeps a checkpoint on purpose |
+| Workbook | **Azure Local - leftover checkpoints**: every VM on a checkpoint now, since when (30 days back), marked when older than `checkpointMaxAgeDays` |
+| Volume | About 290 rows per virtual disk per day at 300 seconds. 250 disks is roughly 70,000 rows a day |
+
+Limits:
+- **48 hours, not 5 days.** A log search alert looks back at most 48 hours, also when the query says `ago(5d)`. The alert therefore fires after 46 hours, and the workbook shows the age against your own limit.
+- **The first days.** "Since" starts at the first sample. A checkpoint that existed before the deployment looks as young as the collection.
+- **Who created it.** Not logged by Hyper-V. `Get-VMSnapshot` shows the name, the type (*Recovery* for backup products, *Standard* for a manual checkpoint) and the creation time. Agree that a manual checkpoint carries a change number or initials in its name.
+- **Removing.** Outside backup windows and one VM at a time, because the merge writes the whole `.avhdx` back. An `.avhdx` without a checkpoint in `Get-VMSnapshot` is not merged by hand without your backup vendor.
 
 ## Design choices
 

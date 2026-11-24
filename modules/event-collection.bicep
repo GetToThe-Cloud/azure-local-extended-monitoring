@@ -1,4 +1,4 @@
-metadata description = 'Supplemental data collection rule for failover clustering and Hyper-V events on Azure Local nodes, associated with every node. Leaves the Insights (AzureStackHCI-) DCR untouched.'
+metadata description = 'Supplemental data collection rule for node events and performance counters on Azure Local nodes, associated with every node. Leaves the Insights (AzureStackHCI-) DCR untouched.'
 
 @description('Name of the data collection rule.')
 param dcrName string
@@ -12,6 +12,13 @@ param workspaceId string
 @description('XPath queries for the Windows event logs to collect.')
 param xPathQueries string[]
 
+@description('Performance counters to collect, for example \'\\Hyper-V Virtual Storage Device(*)\\Latency\'. Empty = no counters.')
+param performanceCounters string[] = []
+
+@description('Sampling interval of the performance counters in seconds.')
+@minValue(10)
+param performanceCounterIntervalSeconds int = 300
+
 @description('Arc machine names of all cluster nodes.')
 param nodeNames string[]
 
@@ -24,16 +31,9 @@ param clusterResourceGroupName string
 @description('Tags.')
 param tags object = {}
 
-// A machine with Azure Monitor Agent can be associated with multiple DCRs. Using a
-// separate DCR keeps the Insights DCR (with its special data stream) as Insights manages it.
-resource dcr 'Microsoft.Insights/dataCollectionRules@2023-03-11' = {
-  name: dcrName
-  location: location
-  tags: tags
-  kind: 'Windows'
-  properties: {
-    description: 'Failover clustering and Hyper-V events from Azure Local nodes. Supplements the AzureStackHCI- Insights DCR.'
-    dataSources: {
+var eventDataSources = empty(xPathQueries)
+  ? {}
+  : {
       windowsEventLogs: [
         {
           name: 'azureLocalClusterEvents'
@@ -44,6 +44,34 @@ resource dcr 'Microsoft.Insights/dataCollectionRules@2023-03-11' = {
         }
       ]
     }
+
+var counterDataSources = empty(performanceCounters)
+  ? {}
+  : {
+      performanceCounters: [
+        {
+          name: 'azureLocalNodeCounters'
+          streams: [
+            'Microsoft-Perf'
+          ]
+          samplingFrequencyInSeconds: performanceCounterIntervalSeconds
+          counterSpecifiers: performanceCounters
+        }
+      ]
+    }
+
+var streams = concat(empty(xPathQueries) ? [] : ['Microsoft-Event'], empty(performanceCounters) ? [] : ['Microsoft-Perf'])
+
+// A machine with Azure Monitor Agent can be associated with multiple DCRs. Using a
+// separate DCR keeps the Insights DCR (with its special data stream) as Insights manages it.
+resource dcr 'Microsoft.Insights/dataCollectionRules@2023-03-11' = {
+  name: dcrName
+  location: location
+  tags: tags
+  kind: 'Windows'
+  properties: {
+    description: 'Node events and performance counters from Azure Local nodes. Supplements the AzureStackHCI- Insights DCR.'
+    dataSources: union(eventDataSources, counterDataSources)
     destinations: {
       logAnalytics: [
         {
@@ -54,9 +82,7 @@ resource dcr 'Microsoft.Insights/dataCollectionRules@2023-03-11' = {
     }
     dataFlows: [
       {
-        streams: [
-          'Microsoft-Event'
-        ]
+        streams: streams
         destinations: [
           'workspace'
         ]

@@ -1,0 +1,17 @@
+// Every VM that runs on an .avhdx (checkpoint) right now, with how long it has been on it.
+// Used by the "leftover checkpoints" workbook. OnCheckpointSince is the first sample in the last
+// 30 days: right after the first deployment, older checkpoints look as young as the collection.
+// See checkpoint-avhdx.kql for how the VM name is read from the counter instance.
+let maxAgeDays = {{MAX_AGE_DAYS}};
+Perf
+| where TimeGenerated > ago(30d)
+| where ObjectName == "Hyper-V Virtual Storage Device" and InstanceName endswith ".avhdx"
+| summarize FirstSeen = min(TimeGenerated), arg_max(TimeGenerated, Computer) by InstanceName
+| where TimeGenerated > ago({{RECENT_MINUTES}}m)
+| extend VMName = extract(@"(?i)ClusterStorage-[^-]+-[0-9a-f]+-(.+?)(?:-?(?:osdisk|datadisk)|-[0-9a-f]{8}-)", 1, InstanceName)
+| extend VMName = iff(isempty(VMName), InstanceName, VMName)
+| extend NodeName = tolower(tostring(split(Computer, ".")[0]))
+| summarize Disks = count(), OnCheckpointSince = min(FirstSeen) by VMName, NodeName
+| extend AgeDays = round((now() - OnCheckpointSince) / 1d, 1)
+| extend Status = iff(AgeDays > maxAgeDays, strcat("Older than ", maxAgeDays, " days"), "")
+| order by AgeDays desc

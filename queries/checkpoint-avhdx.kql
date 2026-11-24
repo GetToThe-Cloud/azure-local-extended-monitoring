@@ -1,0 +1,19 @@
+// Leftover checkpoints: VMs with a disk that has been running on an .avhdx for {{MIN_AGE_HOURS}} hours or longer.
+// Hyper-V does not log the creation of a checkpoint. But every virtual disk in use is an instance
+// of the "Hyper-V Virtual Storage Device" counter, named after its file, and on a checkpoint that
+// file is the .avhdx. A checkpoint of a backup or replication job lives for minutes to hours; one
+// that is still there after {{MIN_AGE_HOURS}} hours was left behind. Replica VMs are off and have no instance.
+// The instance name is the file path with "\" replaced by "-". The VM name is read from the file
+// name (<vm>-OSdisk-..., <vm>-datadisk-..., <vm>dataDisk01..., <vm>-<guid>-...-OSDisk-...). When that
+// fails, the whole instance name is used, so a disk is never missed.
+let excludedVms = dynamic([{{EXCLUDED_VM_NAMES}}]);
+Perf
+| where ObjectName == "Hyper-V Virtual Storage Device" and InstanceName endswith ".avhdx"
+| summarize FirstSeen = min(TimeGenerated), arg_max(TimeGenerated, Computer) by InstanceName
+| where TimeGenerated > ago({{RECENT_MINUTES}}m) and FirstSeen < ago({{MIN_AGE_HOURS}}h)
+| extend VMName = extract(@"(?i)ClusterStorage-[^-]+-[0-9a-f]+-(.+?)(?:-?(?:osdisk|datadisk)|-[0-9a-f]{8}-)", 1, InstanceName)
+| extend VMName = iff(isempty(VMName), InstanceName, VMName)
+| where tolower(VMName) !in (excludedVms)
+| extend NodeName = tolower(tostring(split(Computer, ".")[0]))
+// No datetime column in the result: the alert service would treat it as the time bin.
+| summarize Disks = count() by VMName, NodeName

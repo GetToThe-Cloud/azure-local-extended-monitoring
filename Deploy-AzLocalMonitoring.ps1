@@ -926,7 +926,8 @@ try {
     $deployVmStateAlert = Get-BoolSetting 'deployVmStateAlert' $true
     $deployEventCollection = Get-BoolSetting 'deployEventCollection' $true
     $deployExtensions = (Get-BoolSetting 'deployAmaExtension' $false) -or (Get-BoolSetting 'deployHealthAlertsExtension' $false)
-    $deployLogAlerts = (Get-BoolSetting 'deployEventAlerts' $true) -or (Get-BoolSetting 'deployHeartbeatAlert' $true) -or $deployVmStateAlert -or (Get-BoolSetting 'deployVmHostStateSddcAlert' $true) -or (Get-BoolSetting 'deployVmHostStateScript' $true)
+    $deployCheckpointMonitoring = $deployEventCollection -and (Get-BoolSetting 'deployCheckpointMonitoring' $true)
+    $deployLogAlerts = (Get-BoolSetting 'deployEventAlerts' $true) -or (Get-BoolSetting 'deployHeartbeatAlert' $true) -or $deployVmStateAlert -or (Get-BoolSetting 'deployVmHostStateSddcAlert' $true) -or (Get-BoolSetting 'deployVmHostStateScript' $true) -or $deployCheckpointMonitoring
 
     # All log search alerts run as one user-assigned identity. It needs Log Analytics Reader on the
     # workspace, and Reader on the cluster resource group for the Resource Graph VM state alert.
@@ -972,6 +973,7 @@ try {
     }
     if (Get-BoolSetting 'deployResourceHealthAlert' $true) { $monitoringActions += 'Microsoft.Insights/activityLogAlerts/write' }
     if ($deployEventCollection) { $monitoringActions += 'Microsoft.Insights/dataCollectionRules/write' }
+    if ($deployCheckpointMonitoring) { $monitoringActions += 'Microsoft.Insights/workbooks/write' }
 
     $clusterActions = @('Microsoft.AzureStackHCI/clusters/read', 'Microsoft.HybridCompute/machines/read')
     if ($deployEventCollection -or $deployExtensions -or $deployClusterRoleAssignment) { $clusterActions += 'Microsoft.Resources/deployments/write' }
@@ -1069,6 +1071,31 @@ Event
                 }
                 else {
                     Add-Result 'Data flow' 'VM state monitor' 'Warning' "not reporting on $($notReporting -join ', '): run scripts\Register-AzLocalVmStateTask.ps1 on the cluster, or rerun with -ConfigureClusterNodes"
+                }
+            }
+
+            if ($deployCheckpointMonitoring) {
+                $counterDcrName = "$namePrefix-dcr-azurelocal-cluster-events"
+                $counterDcr = Invoke-Arm -Path "$monitoringResourceGroupId/providers/Microsoft.Insights/dataCollectionRules/$($counterDcrName)?api-version=$($ApiVersions.Dcr)"
+                $counterRows = Invoke-WorkspaceQuery -WorkspaceCustomerId $workspaceCustomerId -Query @"
+Perf
+| where TimeGenerated > ago(30m)
+| where ObjectName == 'Hyper-V Virtual Storage Device'
+| extend NodeName = tolower(tostring(split(Computer, '.')[0]))
+| summarize Disks = dcount(InstanceName), OnCheckpoint = dcountif(InstanceName, InstanceName endswith '.avhdx') by NodeName
+"@
+                $countingNodes = @($counterRows | ForEach-Object { $_.NodeName })
+                $notCounting = @($allNodes | Where-Object { $countingNodes -notcontains $_ })
+                $onCheckpoint = (@($counterRows | ForEach-Object { [int]$_.OnCheckpoint }) | Measure-Object -Sum).Sum
+
+                if ($notCounting.Count -eq 0) {
+                    Add-Result 'Data flow' 'Checkpoint counter' 'Pass' "every node sends the Hyper-V Virtual Storage Device counter; $onCheckpoint virtual disks run on an .avhdx now"
+                }
+                elseif (-not $counterDcr -or -not $counterDcr.properties.dataSources.performanceCounters) {
+                    Add-Result 'Data flow' 'Checkpoint counter' 'Info' 'no counter data yet: expected on the first deployment with checkpoint monitoring, this deployment adds the counter to the DCR'
+                }
+                else {
+                    Add-Result 'Data flow' 'Checkpoint counter' 'Warning' "no Hyper-V Virtual Storage Device counter in the last 30 minutes from: $($notCounting -join ', ') (a node without running VMs has no instances)"
                 }
             }
         }

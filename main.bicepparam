@@ -7,7 +7,7 @@ using './main.bicep'
 param namePrefix = 'azl'
 
 // Workspace that Insights for Azure Local uses (DCR name starts with AzureStackHCI-)
-param workspaceResourceId = '/subscriptions/0c099ebb-b857-4ac4-98b6-b753e9dc4850/resourceGroups/rsg-lz-monitoring-01/providers/Microsoft.OperationalInsights/workspaces/law-lz-01'
+param workspaceResourceId = '/subscriptions/<SUBSCRIPTIONID>/resourceGroups/rsg-lz-monitoring-01/providers/Microsoft.OperationalInsights/workspaces/law-lz-01'
 
 // Resource group with the cluster, the node Arc machines, the Azure Local VMs and the Arc resource bridge
 param clusterResourceGroupName = 'rsg-lz-azlocal-01'
@@ -24,7 +24,7 @@ param clusters = [
 param emailReceivers = [
   {
     name: 'Operations'
-    emailAddress: 'demo@gettothe.cloud'
+    emailAddress: 'notify@provide.nl'
   }
 ]
 
@@ -84,6 +84,13 @@ param defenderCollectAsrAuditEvents = true
 // Hardware errors (WHEA-Logger)
 param deployHardwareErrorMonitoring = true
 param hardwareCorrectedErrorThreshold = 3 // corrected errors per node and event ID in 24 hours
+
+// Leftover checkpoints (VMs that keep running on an .avhdx)
+param deployCheckpointMonitoring = true
+param checkpointAlertAfterHours = 46 // at most 46: a log search alert looks back 48 hours
+param checkpointMaxAgeDays = 5 // marked in the workbook
+param checkpointCounterIntervalSeconds = 300
+param checkpointExcludedVmNames = []
 
 // Feature toggles
 param deployHealthAlertRouting = true

@@ -261,6 +261,28 @@ param deployHardwareErrorMonitoring bool = true
 @minValue(1)
 param hardwareCorrectedErrorThreshold int = 3
 
+// --- Leftover checkpoints ---------------------------------------------------
+
+@description('Collect the Hyper-V Virtual Storage Device counter and alert on VMs that keep running on an .avhdx (a checkpoint that was left behind). Also deploys the workbook "Azure Local - leftover checkpoints".')
+param deployCheckpointMonitoring bool = true
+
+@description('Hours a VM disk must run on an .avhdx before the alert fires. Backup and replication checkpoints are gone within hours. A log search alert looks back at most 48 hours, so at most 46.')
+@minValue(1)
+@maxValue(46)
+param checkpointAlertAfterHours int = 46
+
+@description('Age in days that the checkpoint workbook marks as too old.')
+@minValue(1)
+param checkpointMaxAgeDays int = 5
+
+@description('Sampling interval of the Hyper-V Virtual Storage Device counter in seconds. 300 gives about 290 rows per virtual disk per day.')
+@minValue(60)
+@maxValue(900)
+param checkpointCounterIntervalSeconds int = 300
+
+@description('VMs that may keep a checkpoint without an alert. Matched case-insensitive on the VM name read from the disk file name.')
+param checkpointExcludedVmNames string[] = []
+
 // --- VM state alert ---------------------------------------------------------
 
 @description('Azure Local VM power states that raise an alert.')
@@ -302,7 +324,7 @@ param deployHealthAlertRouting bool = true
 @description('Deploy metric alert rules per cluster.')
 param deployMetricAlerts bool = true
 
-@description('Deploy the supplemental DCR for the node events (failover clustering, Hyper-V, restarts, storage, Defender ASR, hardware errors) and associate it with all nodes.')
+@description('Deploy the supplemental DCR for the node events (failover clustering, Hyper-V, restarts, storage, Defender ASR, hardware errors) and the checkpoint counter, and associate it with all nodes.')
 param deployEventCollection bool = true
 
 @description('Deploy log search alerts on the collected node events.')
@@ -404,6 +426,15 @@ var eventXPathQueries = concat(
   hardwareXPathList
 )
 
+// One instance per virtual disk in use, named after its file. A VM on a checkpoint shows up with
+// its .avhdx. Latency is the counter Microsoft uses for the VHD performance history, so the rows
+// are useful for per-disk latency too.
+var nodePerformanceCounters = deployCheckpointMonitoring
+  ? [
+      '\\Hyper-V Virtual Storage Device(*)\\Latency'
+    ]
+  : []
+
 // KQL conditions for the Sev1 and Sev2 node event alerts. Every condition names its log and, for a
 // shared log such as System, its provider. Event IDs are not unique across logs: 1129 is a
 // partitioned cluster network in FailoverClustering and a warn-mode override in Defender.
@@ -453,7 +484,7 @@ var deployClusterExtensions = deployAmaExtension || deployHealthAlertsExtension
 // Log search alerts run their query as one shared user-assigned identity. Without an identity a
 // rule uses the permissions of whoever last saved it, which breaks silently when that account
 // loses access (an expired PIM activation, a colleague who leaves, a pipeline principal).
-var deployAnyLogAlert = deployEventAlerts || deployHeartbeatAlert || deployVmStateAlert || deployVmHostStateSddcAlert || deployVmHostStateScript
+var deployAnyLogAlert = deployEventAlerts || deployHeartbeatAlert || deployVmStateAlert || deployVmHostStateSddcAlert || deployVmHostStateScript || deployCheckpointMonitoring
 var createAlertRoleAssignments = deployAlertRoleAssignments && deployVmStateRoleAssignments
 var readerRoleId = 'acdd72a7-3385-48ef-bd42-f606fba81ae7'
 var logAnalyticsReaderRoleId = '73c42c96-874c-492b-b04d-ab87d138a893'
@@ -541,13 +572,15 @@ module clusterMetricAlerts 'modules/cluster-metric-alerts.bicep' = [
   }
 ]
 
-module eventCollection 'modules/event-collection.bicep' = if (deployEventCollection && !empty(eventXPathQueries)) {
+module eventCollection 'modules/event-collection.bicep' = if (deployEventCollection && (!empty(eventXPathQueries) || !empty(nodePerformanceCounters))) {
   name: take('${namePrefix}-events-dcr-${uniqueString(deployment().name)}', 64)
   params: {
     dcrName: '${namePrefix}-dcr-azurelocal-cluster-events'
     location: workspace.location
     workspaceId: workspaceResourceId
     xPathQueries: eventXPathQueries
+    performanceCounters: nodePerformanceCounters
+    performanceCounterIntervalSeconds: checkpointCounterIntervalSeconds
     nodeNames: allNodeNames
     clusterSubscriptionId: clusterSubscriptionId
     clusterResourceGroupName: clusterResourceGroupName
@@ -600,6 +633,28 @@ module hardwareErrorAlerts 'modules/hardware-error-alerts.bicep' = if (deployLog
     actionGroupId: actionGroup.outputs.id
     identityId: alertIdentity.outputs.id
     correctedErrorThreshold: hardwareCorrectedErrorThreshold
+    tags: tags
+  }
+  dependsOn: [
+    alertIdentityWorkspaceReader
+  ]
+}
+
+// The workbook is deployed in every phase; the alert rule only with the other log search alerts.
+module checkpointAlerts 'modules/checkpoint-alerts.bicep' = if (deployCheckpointMonitoring && deployEventCollection) {
+  name: take('${namePrefix}-checkpoints-${uniqueString(deployment().name)}', 64)
+  params: {
+    namePrefix: namePrefix
+    location: workspace.location
+    workspaceId: workspaceResourceId
+    actionGroupId: actionGroup.outputs.id
+    identityId: alertIdentity.outputs.id
+    minAgeHours: checkpointAlertAfterHours
+    maxAgeDays: checkpointMaxAgeDays
+    counterIntervalSeconds: checkpointCounterIntervalSeconds
+    excludedVmNames: checkpointExcludedVmNames
+    deployAlertRule: deployLogAlertRules
+    deployWorkbook: true
     tags: tags
   }
   dependsOn: [
