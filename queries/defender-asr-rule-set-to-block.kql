@@ -1,0 +1,15 @@
+// Microsoft Defender event 5007: a Defender setting changed. Fires when an attack surface reduction
+// rule from the audit-only list is set to Block (0x1), for example by an Intune or Defender for
+// Endpoint policy (shown as "SCC" in the event). The Azure Local security baseline keeps rule
+// d1e49aac in Audit (0x2); in Block, the next solution update fails in Cluster-Aware Updating.
+// An empty list watches every ASR rule.
+let auditOnlyRules = dynamic([{{AUDIT_ONLY_RULE_IDS}}]);
+Event
+| where EventLog == "Microsoft-Windows-Windows Defender/Operational" and EventID == 5007
+| extend NewValue = extract(@"New value:\s*([^\r\n]+)", 1, RenderedDescription)
+| where NewValue contains @"\ASR\Rules\" and NewValue matches regex @"=\s*0x1\s*$"
+| extend RuleId = tolower(extract(@"ASR\\Rules\\([0-9A-Fa-f-]{36})", 1, NewValue)),
+         SettingSource = extract(@"^([^\\]+)\\", 1, NewValue),
+         NodeName = tolower(tostring(split(Computer, ".")[0]))
+| where array_length(auditOnlyRules) == 0 or RuleId in (auditOnlyRules)
+| summarize EventCount = count() by NodeName, RuleId, SettingSource

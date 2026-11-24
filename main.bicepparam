@@ -7,17 +7,16 @@ using './main.bicep'
 param namePrefix = 'azl'
 
 // Workspace that Insights for Azure Local uses (DCR name starts with AzureStackHCI-)
-param workspaceResourceId = '/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-monitoring/providers/Microsoft.OperationalInsights/workspaces/law-azurelocal'
+param workspaceResourceId = '/subscriptions/0c099ebb-b857-4ac4-98b6-b753e9dc4850/resourceGroups/rsg-lz-monitoring-01/providers/Microsoft.OperationalInsights/workspaces/law-lz-01'
 
 // Resource group with the cluster, the node Arc machines, the Azure Local VMs and the Arc resource bridge
-param clusterResourceGroupName = 'rg-azurelocal-prod'
+param clusterResourceGroupName = 'rsg-lz-azlocal-01'
 
 param clusters = [
   {
-    name: 'azl-clus01'
+    name: 'cluster'
     nodeNames: [
-      'azl-node01'
-      'azl-node02'
+      'node01'
     ]
   }
 ]
@@ -25,7 +24,7 @@ param clusters = [
 param emailReceivers = [
   {
     name: 'Operations'
-    emailAddress: 'ops@contoso.com'
+    emailAddress: 'demo@gettothe.cloud'
   }
 ]
 
@@ -68,6 +67,23 @@ param vmHostStateIncludeTransitional = false
 param deployVmHostStateScript = true // requires scripts/Register-AzLocalVmStateTask.ps1 on the cluster
 param vmHostStateEventSource = 'AzLocalVmStateMonitor'
 param vmHostStateScriptMaxSilenceMinutes = 20
+
+// Node events beyond failover clustering. The defaults in main.bicep cover Kernel-Power 41 and
+// bugcheck 1001 (Sev1), StorageVSP 9, SMBServer 1020, VMMS 18012/18014/18016 and
+// High-Availability 21502 (Sev2), and User32 1074 (collect only). Set nodeEvents here to replace
+// the whole list, for example to add an event or change a severity.
+
+// Microsoft Defender attack surface reduction (ASR)
+param deployDefenderAsrMonitoring = true
+param defenderAsrAuditOnlyRuleIds = [
+  'd1e49aac-8f56-4280-b9ba-993a6d77406c' // Block process creations originating from PSExec and WMI commands
+]
+param defenderAsrBlockExcludedRuleIds = []
+param defenderCollectAsrAuditEvents = true
+
+// Hardware errors (WHEA-Logger)
+param deployHardwareErrorMonitoring = true
+param hardwareCorrectedErrorThreshold = 3 // corrected errors per node and event ID in 24 hours
 
 // Feature toggles
 param deployHealthAlertRouting = true

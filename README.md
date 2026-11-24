@@ -4,7 +4,7 @@ A Bicep baseline that deploys the alerting around one or more Azure Local cluste
 
 - routing of the built-in health alerts;
 - metric alerts per cluster;
-- extra event collection with log search alerts;
+- extra event collection with log search alerts: failover clustering, unexpected restarts, hardware errors, storage stalls, Defender attack surface reduction;
 - a node heartbeat alert;
 - a Resource Health alert on the Arc resource bridge;
 - alerts on the state of every VM on the cluster, both Azure Local VMs and plain Hyper-V VMs.
@@ -19,8 +19,10 @@ The background and the design choices are explained in the blog post [Azure Loca
 | Health alert routing | `Microsoft.AlertsManagement/actionRules` | Sends health alerts (AzureEdgeAlerts) and the cluster metric alerts to the action group | follows the alert |
 | Maintenance window (optional) | `Microsoft.AlertsManagement/actionRules` | Suppresses notifications during patch night | n/a |
 | Metric alerts per cluster | `Microsoft.Insights/metricAlerts` | CPU, memory (high and N-1), available memory, Storage Degraded, CSV read/write latency, VHD latency, VM memory pressure | 1 to 3 |
-| Extra event collection | `Microsoft.Insights/dataCollectionRules` + associations on all nodes | Failover clustering (System log) and Hyper-V worker events to the workspace | n/a |
-| Cluster event alerts | `Microsoft.Insights/scheduledQueryRules` | Sev1: 1135, 1177, 5120, 5142. Sev2: 1069, 1205, 1254, 18590 | 1 / 2 |
+| Extra event collection | `Microsoft.Insights/dataCollectionRules` + associations on all nodes | Failover clustering, Hyper-V, restart, storage, Defender ASR and WHEA hardware events to the workspace (see [Node events](#node-events)) | n/a |
+| Node event alerts | `Microsoft.Insights/scheduledQueryRules` | Sev1: FailoverClustering 1135, 1177, 5120, 5142; Kernel-Power 41; bugcheck 1001. Sev2: FailoverClustering 1069, 1126, 1127, 1129, 1130, 1205, 1254; Hyper-V-Worker 18590; StorageVSP 9; SMBServer 1020; VMMS 18012, 18014, 18016; Hyper-V-High-Availability 21502 | 1 / 2 |
+| Defender ASR alerts | `Microsoft.Insights/scheduledQueryRules` | An ASR rule that must stay in Audit is set to Block (5007), and ASR blocks (1121) | 2 |
+| Hardware error alerts | `Microsoft.Insights/scheduledQueryRules` | Fatal WHEA errors (Sev1) and corrected WHEA errors piling up on a node (Sev2) | 1 / 2 |
 | Node heartbeat | `Microsoft.Insights/scheduledQueryRules` | A node no longer sends an AMA heartbeat, also when it disappears from the workspace completely | 1 |
 | Arc resource bridge | `Microsoft.Insights/activityLogAlerts` (Resource Health) | Bridge Unavailable or Degraded | n/a |
 | Alert identity | `Microsoft.ManagedIdentity/userAssignedIdentities` + 2 role assignments | One identity that every log search alert runs its query as: Log Analytics Reader on the workspace, Reader on the cluster resource group (for Resource Graph) | n/a |
@@ -43,7 +45,9 @@ modules/
   cluster-metric-alerts.bicep      Metric alerts per cluster
   event-collection.bicep           Supplemental DCR
   dcr-association.bicep            DCR association per node (scope: cluster resource group)
-  event-log-alerts.bicep           Log search alerts on cluster events
+  event-log-alerts.bicep           Log search alerts on node events (Sev1 and Sev2)
+  defender-asr-alerts.bicep        Defender ASR: rule set to Block (5007), ASR blocks (1121)
+  hardware-error-alerts.bicep      WHEA hardware errors: fatal, and corrected errors piling up
   heartbeat-alert.bicep
   resource-health-alert.bicep
   alert-identity.bicep             User-assigned identity for all log search alerts
@@ -175,11 +179,18 @@ Notes:
    ```kusto
    Event
    | where TimeGenerated > ago(1h)
-   | where Source == "Microsoft-Windows-FailoverClustering" or EventLog == "Microsoft-Windows-Hyper-V-Worker-Admin"
-   | summarize count() by Computer, EventID
+   | where EventLog != "Application" and EventLog !startswith "Microsoft-Windows-SDDC" and EventLog !startswith "Microsoft-Windows-Health"
+   | summarize count() by Computer, EventLog, Source, EventID
    ```
-   No rows is normal when nothing happened. In that case, check the DCR association on the nodes (Arc machine > Extensions/Data collection rules).
-4. **Install the VM state monitor** (for `deployVmHostStateScript`). Run this on one node per cluster:
+   Few or no rows is normal when nothing happened; with `defenderCollectAsrAuditEvents` you usually see some Defender 1122 and 5007 events. When there are no rows at all, check the DCR association on the nodes (Arc machine > Extensions/Data collection rules). To check the XPath queries on a node before you deploy, use `Get-WinEvent -LogName '<part before !>' -FilterXPath '<part after !>'`; the queries are in the `eventXPathQueries` output of the deployment.
+4. **Check the Defender rule that blocks updates.** On every node, read the effective value of the PSExec and WMI rule. It must be 2 (Audit):
+   ```powershell
+   $p = Get-MpPreference
+   $i = [array]::IndexOf(@($p.AttackSurfaceReductionRules_Ids | ForEach-Object { $_.ToLower() }), 'd1e49aac-8f56-4280-b9ba-993a6d77406c')
+   if ($i -ge 0) { $p.AttackSurfaceReductionRules_Actions[$i] } else { 'not configured' }
+   ```
+   1 means Block, and the next solution update fails in Cluster-Aware Updating. Change it in the Intune or Defender for Endpoint policy that targets the node; a local change is overwritten.
+5. **Install the VM state monitor** (for `deployVmHostStateScript`). Run this on one node per cluster:
    ```powershell
    .\scripts\Register-AzLocalVmStateTask.ps1 -DryRun
    .\scripts\Register-AzLocalVmStateTask.ps1 -ExcludedVmNames 'template-w2022,lab-vm01'
@@ -191,8 +202,8 @@ Notes:
    | where EventLog == "Application" and Source == "AzLocalVmStateMonitor"
    | project TimeGenerated, Computer, EventID, RenderedDescription
    ```
-5. **Check the SDDC VM counts.** Run the query from `queries/vm-host-state-sddc.kql` in the workspace, with `{{INCLUDE_TRANSITIONAL}}` replaced by `false`, and compare the result with `Get-VM` on the nodes.
-6. **Test the routing.** Temporarily lower a metric alert threshold, or trigger a health fault in a test environment (for example a volume above the warning threshold). For the VM state: pause a test VM and wait 10 to 15 minutes. After a new deployment of the log search alert rules, give the first alert up to half an hour.
+6. **Check the SDDC VM counts.** Run the query from `queries/vm-host-state-sddc.kql` in the workspace, with `{{INCLUDE_TRANSITIONAL}}` replaced by `false`, and compare the result with `Get-VM` on the nodes.
+7. **Test the routing.** Temporarily lower a metric alert threshold, or trigger a health fault in a test environment (for example a volume above the warning threshold). For the VM state: pause a test VM and wait 10 to 15 minutes. After a new deployment of the log search alert rules, give the first alert up to half an hour.
 
 ## When an alert does not fire
 
@@ -234,6 +245,42 @@ The state of a VM on Azure Local is visible in three places. They complement eac
 
 Hyper-V itself does not write an event that says "this VM has been Paused for 10 minutes". The event logs (`Hyper-V-Worker-Admin`, `Hyper-V-VMMS-Admin`, `FailoverClustering`) contain transitions, not state. That is the reason for the script. The cluster event alerts (1069, 1205, 1254) stay useful: their event text contains the name of the VM role.
 
+## Node events
+
+The supplemental DCR collects these events from every node. Each alert condition names its log and, for the System log, its provider: event IDs are not unique across logs (1129 is a partitioned cluster network in FailoverClustering and a warn-mode override in Defender).
+
+| Log / provider | Event ID | Alert | Why |
+|---|---|---|---|
+| System / FailoverClustering | 1135, 1177, 5120, 5142 | Sev1 | Node removed from the cluster, quorum lost, CSV paused or inaccessible |
+| System / FailoverClustering | 1069, 1205, 1254 | Sev2 | Cluster resource or role failed |
+| System / FailoverClustering | 1126, 1127, 1129, 1130 | Sev2 | Cluster network interface unreachable or failed, network partitioned or down. 1135 tells you that a node dropped out; these tell you over which network |
+| Hyper-V-Worker-Admin | 18590 | Sev2 | Guest OS crash |
+| System / Kernel-Power | 41 | Sev1 | Restart without a clean shutdown: crash, power loss, or power-off with the power button or the BMC |
+| System / WER-SystemErrorReporting | 1001 | Sev1 | Node restarted after a bugcheck |
+| System / WHEA-Logger | all, by level | Sev1 / Sev2 | Error and Critical (for example 18 processor, 46 memory): fatal hardware error. Warning (for example 17, 19, 47): corrected error, alert when `hardwareCorrectedErrorThreshold` is reached within 24 hours |
+| Hyper-V-StorageVSP-Admin | 9 | Sev2 | An I/O on a VHDX took about 10 seconds or longer. What a SQL VM feels just before it loses its connection |
+| SMBServer/Operational | 1020 | Sev2 | File system operation took longer than 15 seconds. With ReFS CSVs, I/O from other nodes is redirected over SMB to the volume owner, so it shows up on the owner node |
+| Hyper-V-VMMS-Admin | 18012, 18014, 18016 | Sev2 | Checkpoint failed, cancelled or production checkpoint not possible (backup and replication jobs) |
+| Hyper-V-High-Availability-Admin, and System / Hyper-V-High-Availability | 21502 | Sev2 | Clustered VM operation failed, for example a live migration during a drain. Collected from both logs: depending on the Windows version it lands in one or the other |
+| Windows Defender/Operational | 5007 | Sev2 | An ASR rule from `defenderAsrAuditOnlyRuleIds` is set to Block |
+| Windows Defender/Operational | 1121 | Sev2 | An ASR rule blocked an action, split by node and rule |
+| Windows Defender/Operational | 1122 | none | ASR audit. During an update you expect 1122 instead of 1121 for `InstallMsuFiles.ps1` |
+| System / User32 | 1074 | none | Who or what shut down or restarted the node, with the reason |
+
+All of it is in parameters: `criticalClusterEventIds`, `warningClusterEventIds`, `hyperVWorkerEventIds`, `nodeEvents` (log, provider, IDs and severity per entry; severity 0 collects without an alert) and the `defender*` and `hardware*` parameters.
+
+What is deliberately not here:
+- **6008** (the previous shutdown was unexpected). It comes with every 41, and because the alerts split per event ID you would get two alerts for one failure.
+- **Leftover checkpoints.** Hyper-V does not log the creation of a checkpoint, so a VM that keeps running on an `.avhdx` cannot be found with events.
+- **All CSVs on one node.** With `CsvBalancer` at 0, the volumes stay where they landed after a restart or failure. No event reports that; check `Get-ClusterSharedVolume` after every update, repair or failure.
+- **A failed solution update.** There is no reliable node event for it. Event 5007 on the PSExec and WMI rule is the early warning for the most common cause seen in the field; the update state itself lives in Azure.
+
+### Why the ASR alerts
+
+The Azure Local security baseline keeps the ASR rule *Block process creations originating from PSExec and WMI commands* (`d1e49aac-8f56-4280-b9ba-993a6d77406c`) in Audit. Cluster-Aware Updating starts `InstallMsuFiles.ps1` through `WmiPrvSE.exe`, exactly what that rule blocks. When an Intune or Defender for Endpoint policy targets the nodes with the rule in Block, the cloud policy wins, and the next solution update fails with `MaxFailedNodesExceeded` and exit code `0xffffffff` on the node, while Defender logs a 1121 in the same second. Microsoft describes this in the Azure Local supportability TSG *Solution update CAU run fails due to Windows Defender blocking WMI commands*.
+
+Event 5007 shows the moment a policy sets the rule to Block, often days or weeks before the update window. Event 1121 shows the block itself, but that happens during the update, which is usually inside the maintenance window. When `maintenanceWindow` suppresses notifications, you only find that alert afterwards in the portal. That makes 5007 the alert to act on.
+
 ## Design choices
 
 - **One routing path for cluster alerts.** Health alerts have no alert rule of their own. The only way to notify on them is an alert processing rule on the cluster resource. That is why the metric alert rules deliberately have no action group: the same processing rule routes them, so there are no duplicate mails. The log, heartbeat, VM state and Resource Health alerts do have a direct action group, because they target the workspace or the bridge.
@@ -255,10 +302,13 @@ Hyper-V itself does not write an event that says "this VM has been Paused for 10
     --query "extensionParameters.{publisher:publisher, type:type}"
   ```
   Put them in `healthAlertsExtensionPublisher` and `healthAlertsExtensionType`, and you can deploy the extension to the next clusters with Bicep.
-- **Event IDs.** The cluster events (1069, 1135, 1177, 1205, 1254, 5120, 5142) are standard Windows Server failover clustering events. Check 18590 (guest OS crash, Hyper-V-Worker-Admin) on your own nodes before you page on it. All IDs are parameters.
+- **Event IDs.** The cluster events (1069, 1126, 1127, 1129, 1130, 1135, 1177, 1205, 1254, 5120, 5142) are standard Windows Server failover clustering events. Check 18590 (guest OS crash, Hyper-V-Worker-Admin) on your own nodes before you page on it. All IDs are parameters.
+- **XPath limit.** One XPath query in a DCR supports up to 20 expressions. The failover clustering IDs share one query, so keep `criticalClusterEventIds` and `warningClusterEventIds` at 20 IDs together. Each `nodeEvents` entry is its own query, with at most 20 IDs.
+- **Noisy events.** StorageVSP 9 and SMBServer 1020 come in bursts when storage stalls, for example during Veeam merges; the alert is stateful, so a burst is one alert per node and event. When an ASR rule blocks often and harmlessly in your environment, add it to `defenderAsrBlockExcludedRuleIds`. Turn off `defenderCollectAsrAuditEvents` when many rules are in Audit and the 1122 volume is too high.
+- **Defender event text.** The ASR queries read the rule ID from the event text (`ID:` in 1121, `New value:` in 5007). Run them against your own events once; the text can differ per Defender platform version or system language.
 - **Node names.** The heartbeat alert and the event alerts compare on the short host name (`Computer` up to the first dot, lowercase). Use the Arc machine names in `nodeNames`. On Azure Local they are the same as the host names.
 - **Application Control (WDAC).** New Azure Local deployments run Application Control in Enforced mode. Microsoft's base policy currently has script enforcement disabled, but a stricter policy of your own can put unsigned PowerShell in Constrained Language Mode. `Watch-AzLocalVmState.ps1` and `Register-AzLocalVmStateTask.ps1` therefore avoid .NET method calls, type casts and classes. To run the scripts in Full Language Mode, sign them with a certificate your App Control policy allows.
 - **SDDC event structure.** The query on event 3000 assumes the JSON structure Microsoft documents (`m_servers[].m_vm.m_totalVms<State>`). Check the query in your own workspace first. The Hyper-V state "Saved" probably shows up in these counts as Suspended.
-- **Upgrading from an earlier version.** Earlier versions only gave `azl-vm-state` a system-assigned identity. After this deployment, its role assignments are left behind as "Identity not found" on the workspace and the cluster resource group (the description starts with `Azure Local VM state alert:`). You can remove them under **Access control (IAM) > Role assignments**. In your own `main.bicepparam`, `deployVmStateRoleAssignments` is now called `deployAlertRoleAssignments`; the old name still works.
+- **Upgrading from an earlier version.** Earlier versions only gave `azl-vm-state` a system-assigned identity. After this deployment, its role assignments are left behind as "Identity not found" on the workspace and the cluster resource group (the description starts with `Azure Local VM state alert:`). You can remove them under **Access control (IAM) > Role assignments**. In your own `main.bicepparam`, `deployVmStateRoleAssignments` is now called `deployAlertRoleAssignments`; the old name still works. The node event version keeps the rule names `<namePrefix>-cluster-events-critical` and `-warning`, so they are updated in place. Their `EventIdText` dimension now holds the provider and the ID (`FailoverClustering/1135` instead of `1135`): open alerts on the old value resolve, new ones fire with the new value. `queries/cluster-events.kql` is now `queries/node-events.kql`.
 - **Resource Graph in log search alerts.** A rule with `arg("")` requires a managed identity. One identity supports up to 50 of these rules. Cross-service queries return at most 1,000 rows.
 - **Testing.** The template has been deployed and tested in one lab environment. Test it against your own Azure Local release and hardware, and always start with the what-if.

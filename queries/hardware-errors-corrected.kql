@@ -1,0 +1,8 @@
+// WHEA-Logger warnings on a node: corrected hardware errors, for example 17 (PCI Express),
+// 19 (processor) or 47 (memory). A single one is harmless. A series on the same node can announce
+// a failing DIMM, processor or PCIe device before it takes the node down.
+Event
+| where EventLog == "System" and Source in ("Microsoft-Windows-WHEA-Logger") and EventLevelName == "Warning"
+| extend NodeName = tolower(tostring(split(Computer, ".")[0])),
+         EventIdText = strcat("WHEA-Logger/", tostring(EventID))
+| summarize EventCount = count() by NodeName, EventIdText

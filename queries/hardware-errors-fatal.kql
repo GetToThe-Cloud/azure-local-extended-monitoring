@@ -1,0 +1,8 @@
+// WHEA-Logger errors on a node: a fatal hardware error, for example 18 (processor) or 46 (memory).
+// Windows writes it at the next start, after the node went down. Filtered on level instead of
+// event ID, so a fatal error with an ID that is not listed here is caught too.
+Event
+| where EventLog == "System" and Source in ("Microsoft-Windows-WHEA-Logger") and EventLevelName in ("Error", "Critical")
+| extend NodeName = tolower(tostring(split(Computer, ".")[0])),
+         EventIdText = strcat("WHEA-Logger/", tostring(EventID))
+| summarize EventCount = count() by NodeName, EventIdText

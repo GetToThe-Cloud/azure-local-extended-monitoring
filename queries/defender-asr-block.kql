@@ -1,0 +1,10 @@
+// Microsoft Defender event 1121: an attack surface reduction (ASR) rule blocked an action on a node.
+// On Azure Local, a block by rule d1e49aac (process creations from PSExec and WMI) stops the
+// Cluster-Aware Updating step of a solution update. Rules in the exclusion list are ignored.
+let excludedRules = dynamic([{{EXCLUDED_RULE_IDS}}]);
+Event
+| where EventLog == "Microsoft-Windows-Windows Defender/Operational" and EventID == 1121
+| extend RuleId = tolower(extract(@"\bID:\s*([0-9A-Fa-f-]{36})", 1, RenderedDescription)),
+         NodeName = tolower(tostring(split(Computer, ".")[0]))
+| where RuleId !in (excludedRules)
+| summarize EventCount = count() by NodeName, RuleId

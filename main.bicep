@@ -64,6 +64,26 @@ type thresholdsType = {
   heartbeatMinutes: int
 }
 
+@description('A Windows event to collect from every node, and the severity of its alert.')
+type nodeEventType = {
+  @description('Event log (channel), for example "System" or "Microsoft-Windows-Hyper-V-StorageVSP-Admin".')
+  log: string
+
+  @description('Provider (event source). Needed for shared logs such as System and Application; leave it out for a dedicated channel.')
+  provider: string?
+
+  @description('Event IDs. At most 20 per entry: one XPath query in a DCR supports up to 20 expressions.')
+  @minLength(1)
+  @maxLength(20)
+  eventIds: int[]
+
+  @description('1 = Sev1 alert, 2 = Sev2 alert, 0 = collect only, no alert.')
+  severity: 0 | 1 | 2
+
+  @description('What the events mean. Documentation only.')
+  description: string
+}
+
 // ============================================================================
 // Parameters
 // ============================================================================
@@ -118,7 +138,7 @@ param thresholds thresholdsType = {
 
 // --- Event collection -------------------------------------------------------
 
-@description('Failover clustering event IDs (System log) that raise a Sev1 alert.')
+@description('Failover clustering event IDs (System log) that raise a Sev1 alert. Together with warningClusterEventIds at most 20: they share one XPath query, which supports up to 20 expressions.')
 param criticalClusterEventIds int[] = [
   1135 // Node removed from active cluster membership
   1177 // Cluster service shutting down, quorum lost
@@ -126,9 +146,13 @@ param criticalClusterEventIds int[] = [
   5142 // CSV no longer accessible from this node
 ]
 
-@description('Failover clustering event IDs (System log) that raise a Sev2 alert.')
+@description('Failover clustering event IDs (System log) that raise a Sev2 alert. Together with criticalClusterEventIds at most 20.')
 param warningClusterEventIds int[] = [
   1069 // Cluster resource failed
+  1126 // Cluster network interface unreachable by at least one other node
+  1127 // Cluster network interface failed
+  1129 // Cluster network partitioned
+  1130 // Cluster network down
   1205 // Clustered role failed to come online/offline completely
   1254 // Clustered role exceeded its failover threshold
 ]
@@ -137,6 +161,105 @@ param warningClusterEventIds int[] = [
 param hyperVWorkerEventIds int[] = [
   18590 // Guest operating system crashed (bugcheck)
 ]
+
+@description('Other events from the nodes, each with its own log, provider and severity: unexpected restarts, bugchecks, storage stalls, checkpoint and live migration failures. Severity 0 collects the event without an alert.')
+param nodeEvents nodeEventType[] = [
+  {
+    log: 'System'
+    provider: 'Microsoft-Windows-Kernel-Power'
+    eventIds: [
+      41
+    ]
+    severity: 1
+    description: 'Restart without a clean shutdown: crash, power loss, or power-off with the power button or the BMC (see PowerButtonTimestamp in the event data)'
+  }
+  {
+    log: 'System'
+    provider: 'Microsoft-Windows-WER-SystemErrorReporting'
+    eventIds: [
+      1001
+    ]
+    severity: 1
+    description: 'The node restarted after a bugcheck (stop error), with the stop code'
+  }
+  {
+    log: 'Microsoft-Windows-Hyper-V-StorageVSP-Admin'
+    eventIds: [
+      9
+    ]
+    severity: 2
+    description: 'An I/O on a virtual disk took about 10 seconds or longer; the event names the VHDX'
+  }
+  {
+    log: 'Microsoft-Windows-SMBServer/Operational'
+    eventIds: [
+      1020
+    ]
+    severity: 2
+    description: 'A file system operation took longer than 15 seconds. With ReFS CSVs, I/O from other nodes reaches the volume owner over SMB, so this shows up on the owner node'
+  }
+  {
+    log: 'Microsoft-Windows-Hyper-V-VMMS-Admin'
+    eventIds: [
+      18012
+      18014
+      18016
+    ]
+    severity: 2
+    description: 'Checkpoint failed (18012), cancelled (18014) or production checkpoint not possible (18016), for example during a backup or replication job'
+  }
+  {
+    log: 'Microsoft-Windows-Hyper-V-High-Availability-Admin'
+    eventIds: [
+      21502
+    ]
+    severity: 2
+    description: 'A clustered VM operation failed, for example a live migration during a drain or rebalance'
+  }
+  {
+    log: 'System'
+    provider: 'Microsoft-Windows-Hyper-V-High-Availability'
+    eventIds: [
+      21502
+    ]
+    severity: 2
+    description: 'The same event where Windows writes it to the System log instead of the High-Availability Admin channel. An event lands in one log only, so collecting both does not duplicate alerts'
+  }
+  {
+    log: 'System'
+    provider: 'User32'
+    eventIds: [
+      1074
+    ]
+    severity: 0
+    description: 'Shutdown or restart started by a user or process, with the reason. Collected for root cause analysis, no alert'
+  }
+]
+
+// --- Microsoft Defender attack surface reduction ----------------------------
+
+@description('Collect Microsoft Defender attack surface reduction (ASR) events (1121 block, 1122 audit, 5007 setting changed) and alert on blocks and on rules that are set to Block.')
+param deployDefenderAsrMonitoring bool = true
+
+@description('ASR rules that must stay in Audit on Azure Local nodes. An alert fires when a policy sets one of them to Block. Default: "Block process creations originating from PSExec and WMI commands", which makes Cluster-Aware Updating fail in Block. Empty = alert on every ASR rule that is set to Block.')
+param defenderAsrAuditOnlyRuleIds string[] = [
+  'd1e49aac-8f56-4280-b9ba-993a6d77406c'
+]
+
+@description('ASR rules whose blocks (event 1121) do not raise an alert, for example a rule that blocks often and harmlessly in your environment.')
+param defenderAsrBlockExcludedRuleIds string[] = []
+
+@description('Also collect ASR audit events (1122), without an alert. Useful to confirm during an update that a rule audits instead of blocks. Can be chatty when many rules are in Audit.')
+param defenderCollectAsrAuditEvents bool = true
+
+// --- Hardware errors (WHEA) -------------------------------------------------
+
+@description('Collect WHEA-Logger hardware error events (Critical, Error and Warning) and alert on them: Sev1 for fatal errors, Sev2 when corrected errors pile up on a node.')
+param deployHardwareErrorMonitoring bool = true
+
+@description('Number of corrected hardware errors (WHEA warnings, for example 17, 19 or 47) per node and event ID within 24 hours that raises a Sev2 alert.')
+@minValue(1)
+param hardwareCorrectedErrorThreshold int = 3
 
 // --- VM state alert ---------------------------------------------------------
 
@@ -179,10 +302,10 @@ param deployHealthAlertRouting bool = true
 @description('Deploy metric alert rules per cluster.')
 param deployMetricAlerts bool = true
 
-@description('Deploy the supplemental DCR for failover clustering and Hyper-V events and associate it with all nodes.')
+@description('Deploy the supplemental DCR for the node events (failover clustering, Hyper-V, restarts, storage, Defender ASR, hardware errors) and associate it with all nodes.')
 param deployEventCollection bool = true
 
-@description('Deploy log search alerts on the failover clustering and Hyper-V events.')
+@description('Deploy log search alerts on the collected node events.')
 param deployEventAlerts bool = true
 
 @description('Deploy the node heartbeat alert.')
@@ -254,7 +377,76 @@ var vmStateScriptXPath = 'Application!*[System[Provider[@Name=\'${vmHostStateEve
 var clusterXPathList = empty(allClusterEventIds) ? [] : [clusterXPath]
 var hyperVXPathList = empty(hyperVWorkerEventIds) ? [] : [hyperVXPath]
 var vmStateScriptXPathList = deployVmHostStateScript ? [vmStateScriptXPath] : []
-var eventXPathQueries = concat(clusterXPathList, hyperVXPathList, vmStateScriptXPathList)
+
+// One XPath query per node event entry; the provider filter only when the entry names one.
+var nodeEventXPaths = map(
+  nodeEvents,
+  e =>
+    empty(e.?provider ?? '')
+      ? '${e.log}!*[System[(${join(map(e.eventIds, id => 'EventID=${id}'), ' or ')})]]'
+      : '${e.log}!*[System[Provider[@Name=\'${e.?provider ?? ''}\'] and (${join(map(e.eventIds, id => 'EventID=${id}'), ' or ')})]]'
+)
+
+var defenderEventIds = defenderCollectAsrAuditEvents ? [1121, 1122, 5007] : [1121, 5007]
+var defenderXPath = 'Microsoft-Windows-Windows Defender/Operational!*[System[(${join(map(defenderEventIds, id => 'EventID=${id}'), ' or ')})]]'
+var defenderXPathList = deployDefenderAsrMonitoring ? [defenderXPath] : []
+
+// WHEA by level instead of by event ID, so hardware errors with an ID that is not listed anywhere are collected too.
+var hardwareXPath = 'System!*[System[Provider[@Name=\'Microsoft-Windows-WHEA-Logger\'] and (Level=1 or Level=2 or Level=3)]]'
+var hardwareXPathList = deployHardwareErrorMonitoring ? [hardwareXPath] : []
+
+var eventXPathQueries = concat(
+  clusterXPathList,
+  hyperVXPathList,
+  vmStateScriptXPathList,
+  nodeEventXPaths,
+  defenderXPathList,
+  hardwareXPathList
+)
+
+// KQL conditions for the Sev1 and Sev2 node event alerts. Every condition names its log and, for a
+// shared log such as System, its provider. Event IDs are not unique across logs: 1129 is a
+// partitioned cluster network in FailoverClustering and a warn-mode override in Defender.
+var clusterEventSets = [
+  {
+    log: 'System'
+    provider: 'Microsoft-Windows-FailoverClustering'
+    eventIds: criticalClusterEventIds
+    severity: 1
+  }
+  {
+    log: 'System'
+    provider: 'Microsoft-Windows-FailoverClustering'
+    eventIds: warningClusterEventIds
+    severity: 2
+  }
+  {
+    log: 'Microsoft-Windows-Hyper-V-Worker-Admin'
+    provider: ''
+    eventIds: hyperVWorkerEventIds
+    severity: 2
+  }
+]
+var nodeEventSets = map(nodeEvents, e => {
+  log: e.log
+  provider: e.?provider ?? ''
+  eventIds: e.eventIds
+  severity: e.severity
+})
+var alertEventSets = filter(concat(clusterEventSets, nodeEventSets), s => !empty(s.eventIds) && s.severity > 0)
+var alertEventConditions = map(alertEventSets, s => {
+  severity: s.severity
+  condition: empty(s.provider)
+    ? '(EventLog == "${s.log}" and EventID in (${join(map(s.eventIds, id => string(id)), ', ')}))'
+    : '(EventLog == "${s.log}" and Source in ("${s.provider}") and EventID in (${join(map(s.eventIds, id => string(id)), ', ')}))'
+  label: '${replace(empty(s.provider) ? s.log : s.provider, 'Microsoft-Windows-', '')} ${join(map(s.eventIds, id => string(id)), ', ')}'
+})
+var criticalEventConditions = filter(alertEventConditions, c => c.severity == 1)
+var warningEventConditions = filter(alertEventConditions, c => c.severity == 2)
+var criticalEventFilter = join(map(criticalEventConditions, c => c.condition), '\n    or ')
+var warningEventFilter = join(map(warningEventConditions, c => c.condition), '\n    or ')
+var criticalEventSummary = join(map(criticalEventConditions, c => c.label), '; ')
+var warningEventSummary = join(map(warningEventConditions, c => c.label), '; ')
 
 var deployClusterExtensions = deployAmaExtension || deployHealthAlertsExtension
 
@@ -371,8 +563,43 @@ module eventLogAlerts 'modules/event-log-alerts.bicep' = if (deployLogAlertRules
     workspaceId: workspaceResourceId
     actionGroupId: actionGroup.outputs.id
     identityId: alertIdentity.outputs.id
-    criticalEventIds: criticalClusterEventIds
-    warningEventIds: concat(warningClusterEventIds, hyperVWorkerEventIds)
+    criticalEventFilter: criticalEventFilter
+    warningEventFilter: warningEventFilter
+    criticalEventSummary: criticalEventSummary
+    warningEventSummary: warningEventSummary
+    tags: tags
+  }
+  dependsOn: [
+    alertIdentityWorkspaceReader
+  ]
+}
+
+module defenderAsrAlerts 'modules/defender-asr-alerts.bicep' = if (deployLogAlertRules && deployEventAlerts && deployDefenderAsrMonitoring) {
+  name: take('${namePrefix}-asr-alerts-${uniqueString(deployment().name)}', 64)
+  params: {
+    namePrefix: namePrefix
+    location: workspace.location
+    workspaceId: workspaceResourceId
+    actionGroupId: actionGroup.outputs.id
+    identityId: alertIdentity.outputs.id
+    auditOnlyRuleIds: defenderAsrAuditOnlyRuleIds
+    blockExcludedRuleIds: defenderAsrBlockExcludedRuleIds
+    tags: tags
+  }
+  dependsOn: [
+    alertIdentityWorkspaceReader
+  ]
+}
+
+module hardwareErrorAlerts 'modules/hardware-error-alerts.bicep' = if (deployLogAlertRules && deployEventAlerts && deployHardwareErrorMonitoring) {
+  name: take('${namePrefix}-hw-alerts-${uniqueString(deployment().name)}', 64)
+  params: {
+    namePrefix: namePrefix
+    location: workspace.location
+    workspaceId: workspaceResourceId
+    actionGroupId: actionGroup.outputs.id
+    identityId: alertIdentity.outputs.id
+    correctedErrorThreshold: hardwareCorrectedErrorThreshold
     tags: tags
   }
   dependsOn: [

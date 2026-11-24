@@ -1,4 +1,4 @@
-metadata description = 'Log search alerts on failover clustering and Hyper-V events collected by the supplemental DCR.'
+metadata description = 'Log search alerts on the node events collected by the supplemental DCR: failover clustering, Hyper-V, unexpected restarts, storage and other node events.'
 
 @description('Prefix for resource names.')
 param namePrefix string
@@ -15,35 +15,40 @@ param actionGroupId string
 @description('Resource ID of the user-assigned managed identity the rule runs its query with.')
 param identityId string
 
-@description('Event IDs that raise a Sev1 alert.')
-param criticalEventIds int[]
+@description('KQL condition on the Event table for the events that raise a Sev1 alert. Empty = no Sev1 rule.')
+param criticalEventFilter string
 
-@description('Event IDs that raise a Sev2 alert.')
-param warningEventIds int[]
+@description('KQL condition on the Event table for the events that raise a Sev2 alert. Empty = no Sev2 rule.')
+param warningEventFilter string
+
+@description('Readable list of the Sev1 events, for the rule description.')
+param criticalEventSummary string
+
+@description('Readable list of the Sev2 events, for the rule description.')
+param warningEventSummary string
 
 @description('Tags.')
 param tags object = {}
 
-var baseQuery = loadTextContent('../queries/cluster-events.kql')
-var criticalIdList = join(map(criticalEventIds, id => string(id)), ', ')
-var warningIdList = join(map(warningEventIds, id => string(id)), ', ')
+var baseQuery = loadTextContent('../queries/node-events.kql')
 
+// The rule names stay "cluster-events-*" so an upgrade updates the existing rules in place.
 var rules = [
   {
     key: 'cluster-events-critical'
-    deploy: !empty(criticalEventIds)
+    deploy: !empty(criticalEventFilter)
     severity: 1
-    displayName: 'Azure Local - critical cluster events'
-    description: 'Node removed from cluster membership, quorum loss or CSV I/O problems (event IDs ${criticalIdList}).'
-    query: replace(baseQuery, '{{EVENT_IDS}}', criticalIdList)
+    displayName: 'Azure Local - critical node events'
+    description: 'Node out of the cluster, quorum loss, CSV I/O problems, unexpected restarts or bugchecks. Events: ${criticalEventSummary}.'
+    query: replace(baseQuery, '{{EVENT_FILTER}}', criticalEventFilter)
   }
   {
     key: 'cluster-events-warning'
-    deploy: !empty(warningEventIds)
+    deploy: !empty(warningEventFilter)
     severity: 2
-    displayName: 'Azure Local - cluster resource and VM events'
-    description: 'Cluster resource or role failures and guest OS crashes (event IDs ${warningIdList}).'
-    query: replace(baseQuery, '{{EVENT_IDS}}', warningIdList)
+    displayName: 'Azure Local - cluster, VM and storage events'
+    description: 'Cluster resource, role or network failures, guest OS crashes, storage stalls, checkpoint or live migration failures. Events: ${warningEventSummary}.'
+    query: replace(baseQuery, '{{EVENT_FILTER}}', warningEventFilter)
   }
 ]
 

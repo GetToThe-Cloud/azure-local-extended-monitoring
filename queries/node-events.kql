@@ -1,0 +1,9 @@
+// Events from the Azure Local nodes, collected by the supplemental DCR: failover clustering,
+// Hyper-V, unexpected restarts, storage stalls and the other node events. The filter is built
+// from the event parameters at deployment time. Every condition names its log and, for a shared
+// log such as System, its provider, so an event ID only matches in the log it was meant for.
+Event
+| where {{EVENT_FILTER}}
+| extend NodeName = tolower(tostring(split(Computer, ".")[0])),
+         EventIdText = strcat(replace_string(Source, "Microsoft-Windows-", ""), "/", tostring(EventID))
+| summarize EventCount = count() by NodeName, EventIdText
